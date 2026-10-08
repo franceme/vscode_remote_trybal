@@ -1192,9 +1192,25 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bal_builder.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Build a Ballerina file in a temporary copy of a template project, inside the template's container.",
-        epilog="Build output streams while it runs. After a successful build the temporary folder and the container are"
-        " removed (use --keep to leave both); a failed build keeps the temporary folder and prints its path.",
+        epilog=f"""\
+examples:
+  bal_builder.py compile       hello.bal -o out                # the .jar -> out/
+  bal_builder.py build-graalvm hello.bal -o out                # native executable + .jar -> out/
+  bal_builder.py build-docker  hello.bal                       # docker save -> ./hello.tar
+  bal_builder.py compile       hello.bal --test --scan -o out  # plus test and scan reports in out/
+
+options of compile, build-graalvm and build-docker (see `bal_builder.py COMMAND -h`):
+  -o DIR           copy the outputs (target/bin, build-docker's .tar, reports) to DIR
+  --test           also run `make test`: bal test with a report and code coverage
+  --test-file FILE add a test file to tests/ (repeatable; implies --test)
+  --scan           also run bal scan (in {SCAN_BALLERINA_IMAGE}) and Trivy (vulnerabilities, SBOM)
+  -k, --keep       keep the temporary folder and the container
+  -t DIR           template folder (default: ${TEMPLATE_ENV}, else this script's folder)
+
+Build output streams while it runs. After a successful build the temporary folder and the
+container are removed; a failed build keeps the temporary folder and prints its path.""",
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
