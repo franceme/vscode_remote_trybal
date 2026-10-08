@@ -19,7 +19,7 @@
     },
     "l13Diff.confirmCopy": false,
     "editor.wordWrap": "on",
-    "workbench.colorTheme": "Default Light+",
+    "workbench.colorTheme": "Light+",
     "editor.minimap.enabled": false,
     "latex-workshop.message.error.show": false,
     "latex-workshop.message.warning.show": false,

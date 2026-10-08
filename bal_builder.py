@@ -13,6 +13,10 @@ One script, two front ends that share the same build code:
     python3 bal_builder.py build-docker  hello.bal         # make build_docker  (bal build --cloud=docker), docker save -> ./hello.tar
     python3 bal_builder.py compile hello.bal --test --scan -o out  # also tests and security scans, reports -> out/
     python3 bal_builder.py compile hello.bal --complexity           # also complexity metrics per function
+    python3 bal_builder.py run hello.bal a b                        # build, then run the program with a b
+
+  Scripts: a .bal file whose first line is `#!/usr/bin/env -S bal_builder.py run [options] [-- args]`
+  runs like a script (./hello.bal more args), with the line's args before those of the command line.
 
   MCP server over stdio, with the tools compile_ballerina, build_graalvm and build_docker
   (Python 3.10+ and the `mcp` package; `uv run` installs it from the metadata above):
@@ -76,7 +80,8 @@ WORKDIR = "/workspace"  # where the project lives inside the build container
 LABEL = "bal-builder"  # label on every container and template image this script creates
 
 # capability -> Makefile target in the template
-MAKE_TARGETS = {"compile": "build", "graalvm": "build_graalvm", "docker": "build_docker"}
+MAKE_TARGETS = {"compile": "build", "graalvm": "build_graalvm", "docker": "build_docker", "run": "build"}
+RUN_PROGRAM = 'exec bal run target/bin/*.jar -- "$@"'  # run: the built jar, with the program's arguments
 
 # --complexity: the analyser, next to this script (its README explains the rules and how to update them).
 COMPLEXITY_DIR = SCRIPT_PATH.parent / "bal_complexity"
@@ -176,6 +181,7 @@ class BuildRequest:
     complexity: bool = False  # also measure the complexity of each function
     max_complexity: Optional[int] = None  # fail when a function's cyclomatic complexity is higher (implies complexity)
     visualize: bool = False  # also save the VS Code extension's diagrams of each file and function (needs output_dir)
+    program_args: List[str] = dataclasses.field(default_factory=list)  # run: the arguments of the program
     tar_path: Optional[Path] = None  # docker: set by _normalized to <output_dir or .>/<file stem>.tar
 
 
@@ -197,6 +203,7 @@ class BuildResult:
     vulnerabilities: Optional[dict] = None  # summary of Trivy's report
     complexity: Optional[dict] = None  # summary of BalComplexity's report
     visualizations: Optional[dict] = None  # summary of the captured diagrams
+    program_exit_code: Optional[int] = None  # run: the program's exit code, once it has run
     temp_dir: Optional[str] = None  # set when the temporary folder was left in place
     container: Optional[str] = None  # set when the container was left in place
     output_tail: str = ""
@@ -219,7 +226,8 @@ class Reporter:
 
 
 class ConsoleReporter(Reporter):
-    def __init__(self) -> None:
+    def __init__(self, stream=None) -> None:
+        self._stream = stream or sys.stdout  # build output; `run` keeps stdout for the program's own output
         self._mid_line = False
         self._bold = sys.stderr.isatty() and "NO_COLOR" not in os.environ
 
@@ -235,13 +243,12 @@ class ConsoleReporter(Reporter):
         self._stdout(text)
         self._mid_line = not text.endswith(("\n", "\r"))
 
-    @staticmethod
-    def _stdout(text: str) -> None:
+    def _stdout(self, text: str) -> None:
         try:
-            sys.stdout.write(text)
-            sys.stdout.flush()
+            self._stream.write(text)
+            self._stream.flush()
         except BrokenPipeError:  # e.g. piped into `head`: drop further output, but finish and clean up
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            os.dup2(os.open(os.devnull, os.O_WRONLY), self._stream.fileno())
 
 
 class _Output:
@@ -355,6 +362,25 @@ class _Docker:
                 proc.wait()
             proc.stdout.close()
             self.out.end_stream()
+        self.cancel.check()
+        return returncode
+
+    def run_program(self, container: str, args: List[str]) -> int:
+        """Run the built program in the container, connected to this process's stdin, stdout and stderr."""
+        self.cancel.check()
+        tty = ["--tty"] if sys.stdin.isatty() and sys.stdout.isatty() else []  # then Ctrl-C reaches the program
+        proc = subprocess.Popen(
+            ["docker", "exec", "--interactive", *tty, "--workdir", WORKDIR, container, "sh", "-c", RUN_PROGRAM, "sh", *args],
+            env=dict(os.environ, DOCKER_CLI_HINTS="false"),  # no "What's next" advert after the program's output
+        )
+        self.cancel.attach(proc)
+        try:
+            returncode = proc.wait()
+        finally:
+            self.cancel.detach(proc)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
         self.cancel.check()
         return returncode
 
@@ -487,11 +513,16 @@ def _copy_template(req: BuildRequest, project: Path, out: _Output) -> None:
     ignore = functools.partial(_ignore, req.template, skip)
     shutil.copytree(req.template, project, symlinks=False, ignore_dangling_symlinks=True, ignore=ignore)
     if req.source is not None:
-        (project / "main.bal").write_text(req.source, encoding="utf-8")
+        source = req.source
         out.status("Wrote the given source to main.bal")
     else:
-        shutil.copyfile(req.bal_file, project / "main.bal")
+        source = req.bal_file.read_text(encoding="utf-8")
         out.status(f"Replaced main.bal with {req.bal_file}")
+    if source.startswith("#!"):
+        # Ballerina reads `#` as documentation and rejects it before an import; a comment keeps the line numbers.
+        source = "//" + source[2:]
+        out.status("Turned the #! line into a // comment")
+    (project / "main.bal").write_text(source, encoding="utf-8")
     tests = project / "tests"
     for test_file in req.test_files:
         tests.mkdir(exist_ok=True)
@@ -1088,6 +1119,7 @@ def run_build(req: BuildRequest, reporter: Reporter, cancel: Optional[CancelToke
     out = _Output(reporter, tmp / "build.log")
     docker = _Docker(out, cancel)
     container = None
+    running = False  # run: the program has started
     target = MAKE_TARGETS[req.mode]
     try:
         out.status(f"Temporary folder: {tmp}")
@@ -1132,10 +1164,14 @@ def run_build(req: BuildRequest, reporter: Reporter, cancel: Optional[CancelToke
             if result.image_tar:
                 result.artifacts.append(result.image_tar)
             result.success = not result.problems
+            if req.mode == "run" and result.success:  # the program runs only after a build whose checks passed
+                out.status(f"Running the program with {_plural(len(req.program_args), 'argument')}: {shlex.join(req.program_args)}")
+                running = True
+                result.program_exit_code = docker.run_program(container, req.program_args)
     except Cancelled as exc:
         result.cancelled, result.message = True, str(exc)
     except KeyboardInterrupt:
-        result.cancelled, result.message = True, "The build was interrupted."
+        result.cancelled, result.message = True, "The program was interrupted." if running else "The build was interrupted."
     except (BuildError, OSError) as exc:
         result.message = str(exc)
     finally:
@@ -1262,6 +1298,8 @@ def format_result(result: BuildResult, output_lines: int = 0) -> str:
     lines = [f"`make {MAKE_TARGETS[result.mode]}` {verdict} after {_duration(result.seconds)}{exit_code}{problems}."]
     if result.message:
         lines.append(result.message)
+    if result.program_exit_code is not None:
+        lines.append(f"The program exited with code {result.program_exit_code}.")
     lines += _check_lines(result)
     if result.docker_image:
         lines.append(f"Docker image: {result.docker_image}")
@@ -1588,8 +1626,15 @@ examples:
   bal_builder.py compile       hello.bal --test --scan -o out  # plus test and scan reports in out/
   bal_builder.py compile       hello.bal --max-complexity 10   # fail if a function is too complex
   bal_builder.py compile       hello.bal --visualize -o out    # the VS Code extension's diagrams -> out/visualizations
+  bal_builder.py run           hello.bal a b                   # build, then run the program with the arguments a b
 
-options of compile, build-graalvm and build-docker (see `bal_builder.py COMMAND -h`):
+scripts: with this first line, a .bal file runs like a script (chmod +x hello.bal; ./hello.bal a b):
+  #!/usr/bin/env -S bal_builder.py run --scan -- x y
+  The options before -- are the build's; x y become the program's first arguments, before those of the
+  command line. The line is turned into a comment before the build. Build output is hidden unless the
+  build fails (-v shows it on stderr), so stdout is the program's own; the exit code is the program's.
+
+options of compile, build-graalvm, build-docker and run (see `bal_builder.py COMMAND -h`):
   -o DIR              copy the outputs (target/bin, build-docker's .tar, reports) to DIR
   --test              also run `make test`: bal test with a report and code coverage
   --test-file FILE    add a test file to tests/ (repeatable; implies --test)
@@ -1605,6 +1650,26 @@ container are removed; a failed build keeps the temporary folder and prints its 
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
+    common, build = _common_options(), _build_options()
+    source = argparse.ArgumentParser(add_help=False)
+    source.add_argument("bal_file", type=Path, help="the Ballerina file to build; it replaces main.bal in the copy")
+
+    commands.add_parser("compile", parents=[common, source, build], help="run `make build` (bal build)")
+    commands.add_parser("build-graalvm", parents=[common, source, build], help="run `make build_graalvm` (bal build --graalvm)")
+    commands.add_parser(
+        "build-docker", parents=[common, source, build], help="run `make build_docker` (bal build --cloud=docker) and save the image as a .tar"
+    )
+    run = commands.add_parser(
+        "run",
+        parents=[common, _run_options(), source],
+        help="run `make build`, then the program with the given arguments (also the command of a .bal script's #! line)",
+    )
+    run.add_argument("args", nargs=argparse.REMAINDER, help="the program's arguments")
+    commands.add_parser("mcp", parents=[common], help="serve compile/build-graalvm/build-docker as MCP tools over stdio")
+    return parser
+
+
+def _common_options() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "-t",
@@ -1624,8 +1689,11 @@ container are removed; a failed build keeps the temporary folder and prints its 
         action="store_true",
         help="rebuild the template's .devcontainer image and pull its base, even if .devcontainer is unchanged",
     )
+    return common
+
+
+def _build_options() -> argparse.ArgumentParser:
     build = argparse.ArgumentParser(add_help=False)
-    build.add_argument("bal_file", type=Path, help="the Ballerina file to build; it replaces main.bal in the copy")
     build.add_argument(
         "-o",
         "--output",
@@ -1671,22 +1739,76 @@ container are removed; a failed build keeps the temporary folder and prints its 
         " resource, as PNG (plus the extension's SVG export of sequence diagrams) with an index.html (-> DIR/visualizations; needs -o)",
     )
     build.add_argument("-k", "--keep", action="store_true", help="leave the temporary folder and the container, and print where they are")
+    return build
 
-    commands.add_parser("compile", parents=[common, build], help="run `make build` (bal build)")
-    commands.add_parser("build-graalvm", parents=[common, build], help="run `make build_graalvm` (bal build --graalvm)")
-    commands.add_parser(
-        "build-docker", parents=[common, build], help="run `make build_docker` (bal build --cloud=docker) and save the image as a .tar"
-    )
-    commands.add_parser("mcp", parents=[common], help="serve compile/build-graalvm/build-docker as MCP tools over stdio")
+
+def _run_options() -> argparse.ArgumentParser:
+    run = argparse.ArgumentParser(add_help=False, parents=[_build_options()])
+    run.add_argument("-v", "--verbose", action="store_true", help="show the build's output and steps on stderr")
+    return run
+
+
+def _shebang_parser() -> argparse.ArgumentParser:
+    """The arguments of a #! line after `run`: the build's options, then the program's first arguments."""
+    parser = argparse.ArgumentParser(prog="bal_builder.py run (#! line)", parents=[_common_options(), _run_options()])
+    parser.add_argument("args", nargs="*", help="the program's first arguments")
     return parser
 
 
+def _shebang_args(path: str) -> Optional[List[List[str]]]:
+    """The words after `run` on a script's #! line, as the system may pass them, or None without such a line.
+
+    The first entry honours quotes, as `env -S` does with the line Linux passes it whole; the second is split
+    at spaces only, as the macOS kernel splits the line itself.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            line = fh.readline(4096)
+    except OSError:
+        return None
+    if not line.startswith("#!"):
+        return None
+    try:
+        quoted = shlex.split(line[2:])
+    except ValueError:
+        quoted = line[2:].split()
+    splits = []
+    for words in (quoted, line[2:].split()):
+        if "run" not in words[1:]:
+            return None
+        splits.append(words[words.index("run", 1) + 1:])
+    return splits
+
+
+def _script_call(argv: List[str]) -> Optional[tuple]:
+    """For `run` started by a script's #! line, (#! arguments, script, command-line arguments), else None.
+
+    The system calls the line's command with the line's own arguments first, then the script's path, then the
+    arguments it was run with; the script is the argument whose #! line names exactly the arguments before it.
+    The #! arguments are taken from the line itself, with its quotes, whichever way the system split it.
+    """
+    for i, arg in enumerate(argv):
+        splits = _shebang_args(arg) if os.path.isfile(arg) else None
+        if splits and argv[:i] in splits:
+            return splits[0], arg, argv[i + 1:]
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    args = _parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
+    script = _script_call(argv[1:]) if argv[:1] == ["run"] else None
+    if script is not None:
+        line_args, path, command_line_args = script
+        args = _shebang_parser().parse_args(line_args)
+        args.command, args.bal_file, args.args = "run", Path(path), args.args + command_line_args
+    else:
+        args = _parser().parse_args(argv)
+        if args.command == "run" and args.args[:1] == ["--"]:
+            args.args = args.args[1:]
     if args.command == "mcp":
         return serve_mcp(args.template.expanduser().resolve(), args.image, args.rebuild_image)
 
-    mode = {"compile": "compile", "build-graalvm": "graalvm", "build-docker": "docker"}[args.command]
+    mode = {"compile": "compile", "build-graalvm": "graalvm", "build-docker": "docker", "run": "run"}[args.command]
     req = BuildRequest(
         mode=mode,
         bal_file=args.bal_file,
@@ -1701,6 +1823,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         complexity=args.complexity,
         max_complexity=args.max_complexity,
         visualize=args.visualize,
+        program_args=args.args if mode == "run" else [],
     )
 
     def interrupt(signum: int, frame: object) -> None:
@@ -1710,14 +1833,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), interrupt)
 
-    reporter = ConsoleReporter()
+    if mode != "run":
+        reporter = ConsoleReporter()
+    else:  # stdout is the program's: the build's output goes to stderr with -v, and nowhere otherwise
+        reporter = ConsoleReporter(sys.stderr) if args.verbose else Reporter()
     try:
         result = run_build(req, reporter)
     except BuildError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print("\n" + format_result(result), file=sys.stderr)  # the output itself was streamed already
-    return 0 if result.success else 130 if result.cancelled else 1
+    if mode != "run":
+        print("\n" + format_result(result), file=sys.stderr)  # the output itself was streamed already
+        return 0 if result.success else 130 if result.cancelled else 1
+    if result.program_exit_code is not None and not result.cancelled:
+        if args.verbose or req.output_dir or req.tests or req.scan or req.complexity or req.max_complexity or req.visualize:
+            print("\n" + format_result(result), file=sys.stderr)
+        return result.program_exit_code
+    if result.cancelled:
+        print(result.message, file=sys.stderr)
+        return 130
+    # The build or one of its checks failed, so the program did not run: say why, with the end of the build output.
+    print(format_result(result, output_lines=0 if args.verbose else 40), file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
