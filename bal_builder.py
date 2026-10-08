@@ -12,6 +12,7 @@ One script, two front ends that share the same build code:
     python3 bal_builder.py build-graalvm hello.bal -o out  # make build_graalvm (bal build --graalvm), native executable + .jar -> out/
     python3 bal_builder.py build-docker  hello.bal         # make build_docker  (bal build --cloud=docker), docker save -> ./hello.tar
     python3 bal_builder.py compile hello.bal --test --scan -o out  # also tests and security scans, reports -> out/
+    python3 bal_builder.py compile hello.bal --complexity           # also complexity metrics per function
 
   MCP server over stdio, with the tools compile_ballerina, build_graalvm and build_docker
   (Python 3.10+ and the `mcp` package; `uv run` installs it from the metadata above):
@@ -30,6 +31,10 @@ build-docker's image .tar (saved as ./<file name>.tar without -o) and the report
   --test  `make test`: bal test with a test report and code coverage                  -> test-report/
   --scan  bal scan static analysis, run in a newer Ballerina image                     -> scan-report/
           and Trivy: vulnerabilities and a CycloneDX SBOM of the .jar or the image     -> trivy/
+  --complexity  cyclomatic and cognitive complexity, nesting and size of each function,
+          measured on the template's own Ballerina parser (bal_complexity/)          -> complexity/
+  --visualize  the Ballerina VS Code extension's diagrams of each file, function and service
+          (overview, sequence diagram, data mapper), drawn by the extension (bal_visualizer/) -> visualizations/
 Their results are also summarised at the end of the run.
 
 After a successful build the temporary folder and the container are removed. --keep (MCP: keep_temp)
@@ -59,6 +64,7 @@ import threading
 import time
 import uuid
 import warnings
+import zipfile
 from pathlib import Path
 from typing import Callable, Deque, Dict, Generator, List, Optional
 
@@ -72,10 +78,31 @@ LABEL = "bal-builder"  # label on every container and template image this script
 # capability -> Makefile target in the template
 MAKE_TARGETS = {"compile": "build", "graalvm": "build_graalvm", "docker": "build_docker"}
 
+# --complexity: the analyser, next to this script (its README explains the rules and how to update them).
+COMPLEXITY_DIR = SCRIPT_PATH.parent / "bal_complexity"
+COMPLEXITY_SOURCE = COMPLEXITY_DIR / "BalComplexity.java"
+# It runs with the template's parser jars on a full JDK, which Java's single-file launcher needs to compile
+# it; the template's Ballerina ships only a JRE. The official Ballerina image (also used by --scan) has one.
+COMPLEXITY_JDK_IMAGE = "ballerina/ballerina:2201.13.6"
+COMPLEXITY_LISTED = 10  # most complex functions listed in the summary; complexity.txt has them all
+
+# --visualize: the diagrams of the Ballerina VS Code extension, drawn by the extension itself in a headless VS Code
+# (code-server) and captured with a browser (bal_visualizer/ explains how).
+VISUALIZER_DIR = SCRIPT_PATH.parent / "bal_visualizer"
+VISUALIZER_DRIVER = VISUALIZER_DIR / "driver"  # a small VS Code extension that opens each diagram
+VISUALIZER_CAPTURE = VISUALIZER_DIR / "capture.py"  # runs with Playwright, saves the diagrams
+# The extension version is the one the template's dev container installs (wso2.ballerina@X in .devcontainer/),
+# so the diagrams look as they do there; this one when .devcontainer names none.
+VISUALIZER_EXTENSION_VERSION = "4.7.9"
+CODE_SERVER_VERSION = "4.139.1"
+BROWSER_IMAGE = "mcr.microsoft.com/playwright/python:v1.55.0-noble"  # has the browsers, not the Python package ...
+PLAYWRIGHT_VERSION = "1.55.0"  # ... which is installed at this, matching, version
+VISUALIZER_DRIVER_PORT = 8766
+
 # Never copied from the template: VCS data, build output and caches at any depth ...
 EXCLUDE_EVERYWHERE = (".git", "target", "__pycache__", "*.pyc", ".DS_Store")
-# ... and, at the top level, this script and the places it writes its outputs by default.
-EXCLUDE_AT_ROOT = (SCRIPT_PATH.name, "dist", "*.tar")
+# ... and, at the top level, this script, its helpers and the places it writes its outputs by default.
+EXCLUDE_AT_ROOT = (SCRIPT_PATH.name, COMPLEXITY_DIR.name, VISUALIZER_DIR.name, "dist", "*.tar")
 
 # --scan: bal scan doesn't support the template's Ballerina 2201.7.1, so it runs in a newer official image.
 SCAN_BALLERINA_IMAGE = "ballerina/ballerina:2201.13.6"
@@ -146,6 +173,9 @@ class BuildRequest:
     test_files: List[Path] = dataclasses.field(default_factory=list)  # added to tests/ (implies tests)
     test_source: Optional[str] = None  # written to tests/main_test.bal (implies tests)
     scan: bool = False  # also run bal scan (static analysis) and Trivy (vulnerabilities, SBOM)
+    complexity: bool = False  # also measure the complexity of each function
+    max_complexity: Optional[int] = None  # fail when a function's cyclomatic complexity is higher (implies complexity)
+    visualize: bool = False  # also save the VS Code extension's diagrams of each file and function (needs output_dir)
     tar_path: Optional[Path] = None  # docker: set by _normalized to <output_dir or .>/<file stem>.tar
 
 
@@ -165,6 +195,8 @@ class BuildResult:
     tests: Optional[dict] = None  # summary of bal test's test_results.json
     scan: Optional[dict] = None  # summary of bal scan's scan_results.json
     vulnerabilities: Optional[dict] = None  # summary of Trivy's report
+    complexity: Optional[dict] = None  # summary of BalComplexity's report
+    visualizations: Optional[dict] = None  # summary of the captured diagrams
     temp_dir: Optional[str] = None  # set when the temporary folder was left in place
     container: Optional[str] = None  # set when the container was left in place
     output_tail: str = ""
@@ -333,10 +365,12 @@ class _Docker:
                 raise BuildError(f"Could not pull the image {image}.")
         return image
 
-    def start(self, image: str, name: str, docker_in_docker: bool = False, volumes: tuple = ()) -> None:
+    def start(self, image: str, name: str, docker_in_docker: bool = False, volumes: tuple = (), network: Optional[str] = None) -> None:
         args = ["run", "--detach", "--init", "--name", name, "--label", f"{LABEL}=1"]
         for volume in volumes:
             args += ["--volume", volume]
+        if network:
+            args += ["--network", network]
         if docker_in_docker:
             # Keep the image's entrypoint: in the template image it starts dockerd, which needs privileges.
             args += ["--privileged", image, "sleep", "infinity"]
@@ -345,13 +379,13 @@ class _Docker:
         self.run(*args)
 
     @contextlib.contextmanager
-    def helper(self, image: str, kind: str, volumes: tuple = ()) -> Generator[str, None, None]:
+    def helper(self, image: str, kind: str, volumes: tuple = (), network: Optional[str] = None) -> Generator[str, None, None]:
         """A throwaway container for a check (bal scan, Trivy), removed afterwards whatever happens."""
         name = f"{LABEL}-{kind}-{uuid.uuid4().hex[:8]}"
         with _RUNNING_LOCK:
             _RUNNING[name] = self.cancel
         try:
-            self.start(image, name, volumes=volumes)
+            self.start(image, name, volumes=volumes, network=network)
             yield name
         finally:
             self.run("rm", "--force", "--volumes", name, check=False)
@@ -552,6 +586,14 @@ def _normalized(req: BuildRequest) -> BuildRequest:
     output_dir = req.output_dir.expanduser().resolve() if req.output_dir is not None else None
     if output_dir is not None and output_dir.exists() and not output_dir.is_dir():
         raise BuildError(f"The output path {output_dir} exists and is not a folder.")
+    if req.max_complexity is not None and req.max_complexity < 1:
+        raise BuildError("The complexity limit must be 1 or more.")
+    if (req.complexity or req.max_complexity is not None) and not COMPLEXITY_SOURCE.is_file():
+        raise BuildError(f"The complexity analyser {COMPLEXITY_SOURCE} is missing.")
+    if req.visualize and output_dir is None:
+        raise BuildError("The diagrams are saved in the output folder: pass one with -o DIR (MCP: output_dir).")
+    if req.visualize and not (VISUALIZER_CAPTURE.is_file() and (VISUALIZER_DRIVER / "package.json").is_file()):
+        raise BuildError(f"The visualizer in {VISUALIZER_DIR} is missing.")
     return dataclasses.replace(
         req,
         template=template,
@@ -559,6 +601,7 @@ def _normalized(req: BuildRequest) -> BuildRequest:
         output_dir=output_dir,
         tests=req.tests or bool(test_files) or req.test_source is not None,
         test_files=test_files,
+        complexity=req.complexity or req.max_complexity is not None,
         tar_path=(output_dir or Path.cwd()) / f"{stem}.tar" if req.mode == "docker" else None,
     )
 
@@ -584,7 +627,7 @@ def _failure_hint(mode: str, tail: Deque[str]) -> str:
     return ""
 
 
-# --------------------------------------------------------------------------- checks (--test, --scan)
+# --------------------------------------------------------------------------- checks (--test, --scan, --complexity)
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")  # Trivy's, most severe first
 
@@ -778,6 +821,250 @@ def _trivy(req: BuildRequest, docker: _Docker, out: _Output, container: str, rep
     return None
 
 
+def _complexity(req: BuildRequest, docker: _Docker, out: _Output, container: str, project: Path, reports: Path, tmp: Path, result: BuildResult) -> Optional[str]:
+    # The parser of the Ballerina version the build used, so the analyser reads the code as the compiler does.
+    lib = 'lib="$(bal home)/bre/lib" && ls "$lib"/ballerina-parser-*.jar "$lib"/ballerina-tools-api-*.jar'
+    found = docker.run("exec", container, "sh", "-c", lib, check=False)
+    jars = found.stdout.split()
+    version = re.search(r"ballerina-parser-(.+)\.jar$", jars[0]) if jars else None
+    if found.returncode != 0 or len(jars) != 2 or version is None:
+        return "the complexity analysis could not find Ballerina's parser (`bal home`/bre/lib/ballerina-parser-*.jar) in the build image"
+    analyser = tmp / "complexity"
+    analyser.mkdir()
+    for jar in jars:
+        docker.run("cp", f"{container}:{jar}", str(analyser))
+    shutil.copy2(COMPLEXITY_SOURCE, analyser)
+    docker.ensure_image(COMPLEXITY_JDK_IMAGE)
+    with docker.helper(COMPLEXITY_JDK_IMAGE, "complexity") as helper:
+        docker.copy_in(project, helper, COMPLEXITY_JDK_IMAGE)
+        docker.run("cp", f"{analyser}{os.sep}.", f"{helper}:/tmp/complexity")
+        out.status(f"Measuring complexity with the Ballerina {version.group(1)} parser ({COMPLEXITY_SOURCE.name})")
+        returncode = docker.stream(
+            "exec", "--workdir", WORKDIR, helper,
+            "java", "-cp", "/tmp/complexity/*", f"/tmp/complexity/{COMPLEXITY_SOURCE.name}", WORKDIR, "/tmp/complexity.json",
+        )
+        raw = docker.run("exec", helper, "cat", "/tmp/complexity.json", check=False)
+    if returncode != 0 or raw.returncode != 0:
+        return f"the complexity analyser failed with exit code {returncode}"
+    data = dict(ballerina=version.group(1), **json.loads(raw.stdout))
+
+    functions = [
+        dict(fn, file=item["file"], function=f"{fn['container']}.{fn['name']}" if fn["container"] else fn["name"])
+        for item in data["files"]
+        for fn in item["functions"]
+    ]
+    functions.sort(key=lambda fn: (-fn["cyclomatic"], -fn["cognitive"], fn["file"], fn["line"]))
+    limit = req.max_complexity
+    over = [fn for fn in functions if limit is not None and fn["cyclomatic"] > limit]
+    mismatches = [  # from `// complexity-expect:` comments, as in bal_complexity/fixture.bal
+        f"{fn['file']}:{fn['line']} {fn['function']}: {measure} is {fn.get(measure, 'not measured')}, expected {expected}"
+        for fn in sorted(functions, key=lambda fn: (fn["file"], fn["line"]))
+        for measure, expected in fn["expected"].items()
+        if fn.get(measure) != expected
+    ]
+    result.complexity = {
+        "ballerina": data["ballerina"],
+        "files": len(data["files"]),
+        "syntax_errors": sum(item["syntaxErrors"] for item in data["files"]),
+        "limit": limit,
+        "functions": functions,
+        "over": len(over),
+        "mismatches": mismatches,
+    }
+    folder = reports / "complexity"
+    folder.mkdir()
+    (folder / "complexity.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    (folder / "complexity.txt").write_text(_complexity_table(data, functions, limit), encoding="utf-8")
+
+    problems = []
+    if over:
+        problems.append(f"{_plural(len(over), 'function is', 'functions are')} over the complexity limit of {limit}")
+    if mismatches:
+        problems.append(f"{_plural(len(mismatches), 'complexity expectation')} not met")
+    return "; ".join(problems) or None
+
+
+def _complexity_table(data: dict, functions: List[dict], limit: Optional[int]) -> str:
+    """complexity.txt: every function, most complex first."""
+    lines = [
+        f"Complexity of {_plural(len(functions), 'function')} in {_plural(len(data['files']), 'file')}, measured with the"
+        f" Ballerina {data['ballerina']} parser (BalComplexity rules version {data['rulesVersion']}).",
+        "cyclomatic: McCabe's count of paths; cognitive: SonarSource's Cognitive Complexity; nesting: deepest block;"
+        " lines: lines of code. See bal_complexity/README.md for how each is counted.",
+        "",
+        f"{'cyclomatic':>10}  {'cognitive':>9}  {'nesting':>7}  {'lines':>5}  {'params':>6}  function (location)",
+    ]
+    for fn in functions:
+        flag = f"  over the limit of {limit}" if limit is not None and fn["cyclomatic"] > limit else ""
+        lines.append(
+            f"{fn['cyclomatic']:>10}  {fn['cognitive']:>9}  {fn['nesting']:>7}  {fn['lines']:>5}  {fn['parameters']:>6}"
+            f"  {fn['function']} ({fn['file']}:{fn['line']}){flag}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _extension_version(req: BuildRequest) -> str:
+    """The Ballerina extension version the template's dev container installs (wso2.ballerina@X in .devcontainer/)."""
+    folder = req.template / ".devcontainer"
+    for path in sorted(folder.rglob("*")) if folder.is_dir() else ():
+        if path.is_file() and path.stat().st_size < 1_000_000:
+            match = re.search(r"wso2\.ballerina@([0-9][\w.-]*)", path.read_text(encoding="utf-8", errors="replace"))
+            if match:
+                return match.group(1)
+    return VISUALIZER_EXTENSION_VERSION
+
+
+def _pack_vsix(folder: Path, dest: Path) -> None:
+    """Package a VS Code extension folder as a .vsix (a zip with a manifest), so code-server can install it."""
+    package = json.loads((folder / "package.json").read_text(encoding="utf-8"))
+    manifest = f"""<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
+  <Metadata>
+    <Identity Language="en-US" Id="{package['name']}" Version="{package['version']}" Publisher="{package['publisher']}"/>
+    <DisplayName>{package['displayName']}</DisplayName>
+    <Properties><Property Id="Microsoft.VisualStudio.Code.Engine" Value="{package['engines']['vscode']}"/></Properties>
+  </Metadata>
+  <Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation>
+  <Dependencies/>
+  <Assets><Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/></Assets>
+</PackageManifest>
+"""
+    content_types = (
+        '<?xml version="1.0" encoding="utf-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension=".json" ContentType="application/json"/><Default Extension=".js" ContentType="application/javascript"/>'
+        '<Default Extension=".vsixmanifest" ContentType="text/xml"/></Types>'
+    )
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as vsix:
+        vsix.writestr("extension.vsixmanifest", manifest)
+        vsix.writestr("[Content_Types].xml", content_types)
+        for path in sorted(folder.rglob("*")):
+            if path.is_file():
+                vsix.write(path, "extension/" + path.relative_to(folder).as_posix())
+
+
+# The headless VS Code's user settings: no telemetry, update checks, AI panels or welcome pages in the way.
+VISUALIZER_SETTINGS = {
+    "ballerina.enableTelemetry": False,
+    "ballerina.codeLens.all.enabled": True,
+    "telemetry.telemetryLevel": "off",
+    "security.workspace.trust.enabled": False,
+    "workbench.startupEditor": "none",
+    "workbench.tips.enabled": False,
+    "workbench.enableExperiments": False,
+    "workbench.colorTheme": "Default Light Modern",
+    "workbench.secondarySideBar.defaultVisibility": "hidden",
+    "chat.disableAIFeatures": True,
+    "remote.autoForwardPorts": False,  # else a toast announces the driver's port, over the diagram
+    "extensions.autoCheckUpdates": False,
+    "extensions.autoUpdate": False,
+    "update.mode": "none",
+}
+VISUALIZER_HOME = "/opt/bal-visualizer"  # code-server's extensions and user data in the visualizer image
+
+
+def _visualizer_image(req: BuildRequest, docker: _Docker, out: _Output, tmp: Path, base: str, version: str) -> str:
+    """The template image plus code-server, the Ballerina extension and the driver, built on first use."""
+    base_id = docker.run("image", "inspect", "--format", "{{.Id}}", base).stdout.strip().split(":")[-1]
+    digest = hashlib.sha256(json.dumps([CODE_SERVER_VERSION, VISUALIZER_SETTINGS]).encode())
+    for path in sorted(VISUALIZER_DRIVER.rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(VISUALIZER_DRIVER).as_posix().encode() + b"\0" + path.read_bytes())
+    tag = f"{LABEL}-visualizer:{base_id[:12]}-{version}-{digest.hexdigest()[:8]}"
+    if not req.rebuild_image and docker.run("image", "inspect", tag, check=False).returncode == 0:
+        return tag
+    context = tmp / "visualizer-image"
+    context.mkdir(exist_ok=True)
+    _pack_vsix(VISUALIZER_DRIVER, context / "driver.vsix")
+    (context / "settings.json").write_text(json.dumps(VISUALIZER_SETTINGS, indent=2) + "\n", encoding="utf-8")
+    vsix = f"https://open-vsx.org/api/wso2/ballerina/{version}/file/wso2.ballerina-{version}.vsix"
+    code_server = f"https://github.com/coder/code-server/releases/download/v{CODE_SERVER_VERSION}/code-server-{CODE_SERVER_VERSION}-linux"
+    (context / "Dockerfile").write_text(
+        f"""FROM {base}
+USER root
+RUN set -e; case "$(uname -m)" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; *) echo "no code-server for $(uname -m)"; exit 1;; esac; \\
+    curl -fsSL "{code_server}-$arch.tar.gz" | tar -xz -C /opt; \\
+    ln -sf /opt/code-server-{CODE_SERVER_VERSION}-linux-$arch/bin/code-server /usr/local/bin/code-server; \\
+    curl -fsSL -o /tmp/wso2.ballerina.vsix "{vsix}"
+COPY driver.vsix settings.json /tmp/bal-visualizer/
+RUN code-server --extensions-dir {VISUALIZER_HOME}/extensions \\
+        --install-extension /tmp/wso2.ballerina.vsix --install-extension /tmp/bal-visualizer/driver.vsix \\
+ && mkdir -p {VISUALIZER_HOME}/data/User && mv /tmp/bal-visualizer/settings.json {VISUALIZER_HOME}/data/User/ \\
+ && rm -rf /tmp/wso2.ballerina.vsix /tmp/bal-visualizer && chmod -R a+rwX {VISUALIZER_HOME}
+""",
+        encoding="utf-8",
+    )
+    out.status(f"Building the visualizer image {tag}: code-server {CODE_SERVER_VERSION} and the Ballerina extension {version} on {base}")
+    args = ["build", "--tag", tag, "--label", f"{LABEL}.visualizer=1"] + (["--pull"] if req.rebuild_image else [])
+    if docker.stream(*args, str(context), env={"BUILDKIT_PROGRESS": "plain"}) != 0:
+        raise BuildError(f"building the visualizer image {tag} failed")
+    return tag
+
+
+def _browser_image(req: BuildRequest, docker: _Docker, out: _Output, tmp: Path) -> str:
+    """BROWSER_IMAGE with Playwright's Python package, built on first use."""
+    tag = f"{LABEL}-browser:playwright-{PLAYWRIGHT_VERSION}"
+    if not req.rebuild_image and docker.run("image", "inspect", tag, check=False).returncode == 0:
+        return tag
+    context = tmp / "browser-image"
+    context.mkdir(exist_ok=True)
+    (context / "Dockerfile").write_text(
+        f"FROM {BROWSER_IMAGE}\nRUN pip install --no-cache-dir --break-system-packages playwright=={PLAYWRIGHT_VERSION}\n", encoding="utf-8"
+    )
+    out.status(f"Building the browser image {tag}: {BROWSER_IMAGE} with Playwright for Python")
+    args = ["build", "--tag", tag, "--label", f"{LABEL}.browser=1"] + (["--pull"] if req.rebuild_image else [])
+    if docker.stream(*args, str(context), env={"BUILDKIT_PROGRESS": "plain"}) != 0:
+        raise BuildError(f"building the browser image {tag} failed")
+    return tag
+
+
+def _visualize(req: BuildRequest, docker: _Docker, out: _Output, project: Path, reports: Path, tmp: Path, base: str, result: BuildResult) -> Optional[str]:
+    version = _extension_version(req)
+    image = _visualizer_image(req, docker, out, tmp, base, version)
+    browser_image = _browser_image(req, docker, out, tmp)
+    folder = reports / "visualizations"
+    code_server = [
+        "code-server", "--auth", "none", "--bind-addr", "127.0.0.1:8080", "--disable-telemetry", "--disable-update-check",
+        "--disable-workspace-trust", "--disable-getting-started-override",
+        "--user-data-dir", f"{VISUALIZER_HOME}/data", "--extensions-dir", f"{VISUALIZER_HOME}/extensions", WORKDIR,
+    ]
+    with docker.helper(image, "visualizer") as editor:
+        docker.copy_in(project, editor, image)
+        out.status(f"Starting a headless VS Code (code-server {CODE_SERVER_VERSION}) with the Ballerina extension {version}")
+        docker.run(
+            "exec", "--detach", "--env", f"BAL_VISUALIZER_PORT={VISUALIZER_DRIVER_PORT}", editor,
+            "sh", "-c", f"{shlex.join(code_server)} > /tmp/code-server.log 2>&1",
+        )
+        # The browser shares the editor's network, so code-server and the driver are on its 127.0.0.1.
+        with docker.helper(browser_image, "browser", network=f"container:{editor}") as browser:
+            docker.run("cp", str(VISUALIZER_CAPTURE), f"{browser}:/tmp/capture.py")
+            out.status("Capturing the diagrams the extension draws for each file, function and service")
+            returncode = docker.stream(
+                "exec", browser, "python3", "/tmp/capture.py", "--out", "/tmp/visualizations", "--workspace", WORKDIR,
+                "--driver", f"http://127.0.0.1:{VISUALIZER_DRIVER_PORT}",
+            )
+            if returncode == 0:
+                docker.run("cp", f"{browser}:/tmp/visualizations/.", str(folder))
+        if returncode != 0:
+            log = docker.run("exec", editor, "tail", "-n", "40", "/tmp/code-server.log", check=False).stdout
+            if log.strip():
+                out.status("The end of code-server's log")
+                out.output(log)
+            return f"capturing the diagrams failed with exit code {returncode}"
+    manifest = json.loads((folder / "visualizations.json").read_text(encoding="utf-8"))
+    diagrams = [dict(diagram, file=entry["file"]) for entry in manifest["files"] for diagram in entry["diagrams"]]
+    failed = [d for d in diagrams if d.get("error")]
+    result.visualizations = {
+        "extension": manifest["extension"],
+        "vscode": manifest["vscode"],
+        "files": len(manifest["files"]),
+        "kinds": collections.Counter(d["kind"] for d in diagrams if not d.get("error")),
+        "svgs": sum(1 for d in diagrams if d.get("svg")),
+        "failed": [f"{d['file']}: {d['name']}: {d['error']}" for d in failed],
+        "svg_failed": [f"{d['file']}: {d['name']}: {d['svg_error']}" for d in diagrams if d.get("svg_error")],
+    }
+    return f"{_plural(len(failed), 'diagram')} could not be captured" if failed else None
+
+
 def _copy_outputs(req: BuildRequest, docker: _Docker, out: _Output, container: str, reports: Path, tmp: Path, result: BuildResult) -> None:
     out.status(f"Copying the outputs to {req.output_dir}")
     req.output_dir.mkdir(parents=True, exist_ok=True)
@@ -830,6 +1117,14 @@ def run_build(req: BuildRequest, reporter: Reporter, cancel: Optional[CancelToke
             if req.scan:
                 result.problems += _checked("bal scan", lambda: _bal_scan(req, docker, out, project, reports, tmp, result))
                 result.problems += _checked("Trivy", lambda: _trivy(req, docker, out, container, reports, tmp, result))
+            if req.complexity:
+                result.problems += _checked(
+                    "The complexity analysis", lambda: _complexity(req, docker, out, container, project, reports, tmp, result)
+                )
+            if req.visualize:
+                result.problems += _checked(
+                    "The visualization", lambda: _visualize(req, docker, out, project, reports, tmp, image, result)
+                )
             if req.tests:  # last, so that the end of the output shows how the tests went
                 result.problems += _checked("make test", lambda: _run_tests(docker, out, container, reports, result))
             if req.output_dir is not None:
@@ -876,7 +1171,7 @@ def _plural(count: int, singular: str, plural: Optional[str] = None) -> str:
 
 
 def _check_lines(result: BuildResult) -> List[str]:
-    """Summaries of the --test and --scan results."""
+    """Summaries of the --test, --scan and --complexity results."""
     lines = []
     tests = result.tests
     if tests is not None and not tests["total"]:
@@ -913,6 +1208,45 @@ def _check_lines(result: BuildResult) -> List[str]:
             lines.append(f"  {vuln_id}  {severity}  {package} {installed}" + (f", fixed in {fixed}" if fixed else ""))
         if sum(counts.values()) > len(result.vulnerabilities["top"]):
             lines.append(f"  ... and {sum(counts.values()) - len(result.vulnerabilities['top'])} more in trivy/vulnerabilities.txt")
+    if result.complexity is not None:
+        cx = result.complexity
+        functions = cx["functions"]
+        where = f"{_plural(len(functions), 'function')} in {_plural(cx['files'], 'file')}"
+        if functions:
+            average = sum(fn["cyclomatic"] for fn in functions) / len(functions)
+            detail = (
+                f"cyclomatic highest {functions[0]['cyclomatic']}, average {average:.1f}; cognitive highest"
+                f" {max(fn['cognitive'] for fn in functions)}; deepest nesting {max(fn['nesting'] for fn in functions)}"
+            )
+            if cx["limit"] is not None:
+                detail += f"; {cx['over'] or 'none'} over the limit of {cx['limit']}"
+        else:
+            detail = "nothing to measure"
+        lines.append(f"Complexity (Ballerina {cx['ballerina']} parser, {where}): {detail}.")
+        if cx["syntax_errors"]:
+            lines.append(f"  the parser reported {_plural(cx['syntax_errors'], 'syntax error')}, so some values may be off")
+        shown = functions[:COMPLEXITY_LISTED]
+        for fn in shown:
+            flag = ", over the limit" if cx["limit"] is not None and fn["cyclomatic"] > cx["limit"] else ""
+            lines.append(
+                f"  {fn['file']}:{fn['line']}  {fn['function']}  cyclomatic {fn['cyclomatic']}, cognitive {fn['cognitive']},"
+                f" nesting {fn['nesting']}, {_plural(fn['lines'], 'line')}{flag}"
+            )
+        if len(functions) > len(shown):
+            lines.append(f"  ... and {len(functions) - len(shown)} more in complexity/complexity.txt")
+        lines += [f"  expectation not met: {mismatch}" for mismatch in cx["mismatches"]]
+    if result.visualizations is not None:
+        viz = result.visualizations
+        names = {"overview": ("overview", None), "sequence": ("sequence diagram", None), "data-mapper": ("data mapper", None),
+                 "service": ("service", None), "diagram": ("other diagram", None)}
+        kinds = ", ".join(_plural(count, *names.get(kind, (kind, None))) for kind, count in viz["kinds"].most_common())
+        svgs = f"; {_plural(viz['svgs'], 'SVG')} from the extension's export" if viz["svgs"] else ""
+        lines.append(
+            f"Visualizations (Ballerina extension {viz['extension']} in VS Code {viz['vscode']}, {_plural(viz['files'], 'file')}):"
+            f" {kinds or 'nothing to draw'}{svgs}."
+        )
+        lines += [f"  not captured: {failure}" for failure in viz["failed"]]
+        lines += [f"  PNG only: {failure}" for failure in viz["svg_failed"]]
     return lines
 
 
@@ -1056,6 +1390,9 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         test_files: Optional[List[str]],
         test_source: Optional[str],
         security_scan: bool,
+        complexity: bool,
+        max_complexity: Optional[int],
+        visualize: bool,
         keep_temp: bool,
     ) -> BuildRequest:
         rebuild, pending_rebuild[0] = pending_rebuild[0], False
@@ -1072,6 +1409,9 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
             test_files=[Path(path) for path in test_files or []],
             test_source=test_source,
             scan=security_scan,
+            complexity=complexity,
+            max_complexity=max_complexity,
+            visualize=visualize,
         )
 
     BalFile = Annotated[
@@ -1082,8 +1422,8 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         Optional[str],
         Field(
             description="Folder to copy the outputs to, so they outlive the temporary copy: target/bin (the executable .jar, plus"
-            " the native executable for build_graalvm), build_docker's image .tar and the reports of run_tests and"
-            " security_scan. Without it, build_docker saves the .tar as ./<file name>.tar and the checks are only summarised."
+            " the native executable for build_graalvm), build_docker's image .tar, the reports of run_tests, security_scan"
+            " and complexity, and the diagrams of visualize. Without it, build_docker saves the .tar as ./<file name>.tar and the checks are only summarised."
         ),
     ]
     RunTests = Annotated[
@@ -1105,6 +1445,26 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
             " the image plus a CycloneDX SBOM (output_dir/trivy). The first scan downloads images and vulnerability databases."
         ),
     ]
+    Complexity = Annotated[
+        bool,
+        Field(
+            description="Also measure each function's cyclomatic and cognitive complexity, deepest nesting and lines of code,"
+            " with the template's own Ballerina parser (output_dir/complexity). The result lists the most complex functions."
+        ),
+    ]
+    MaxComplexity = Annotated[
+        Optional[int],
+        Field(description="Fail the build when a function's cyclomatic complexity is higher than this (10 is a common limit); implies complexity.", ge=1),
+    ]
+    Visualize = Annotated[
+        bool,
+        Field(
+            description="Also save the Ballerina VS Code extension's diagrams, drawn by the extension itself in a headless VS Code:"
+            " each file's overview and, for each function, method, service and resource, its sequence diagram, data mapper or"
+            " service view (PNG, plus the extension's SVG export of sequence diagrams) in output_dir/visualizations, with an"
+            " index.html. Needs output_dir. The first run builds two images."
+        ),
+    ]
     KeepTemp = Annotated[
         bool,
         Field(
@@ -1120,7 +1480,8 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
             " (the given file or source replaces its main.bal). compile_ballerina is a quick compile check;"
             " build_graalvm makes a native executable (takes minutes); build_docker makes a Docker image saved"
             " as a .tar. output_dir collects the .jar, native executable or image .tar and the reports;"
-            " run_tests adds bal test with coverage, security_scan adds bal scan and Trivy. Build output streams"
+            " run_tests adds bal test with coverage, security_scan adds bal scan and Trivy, complexity adds"
+            " complexity metrics per function, visualize adds the VS Code extension's diagrams. Build output streams"
             " as progress notifications; the result summarises the checks and ends with the last lines of output."
         ),
     )
@@ -1135,13 +1496,19 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         test_files: TestFiles = None,
         test_source: TestSource = None,
         security_scan: SecurityScan = False,
+        complexity: Complexity = False,
+        max_complexity: MaxComplexity = None,
+        visualize: Visualize = False,
         keep_temp: KeepTemp = False,
     ) -> str:
         """Compile a Ballerina program with `make build` (bal build) in a copy of the template project, inside the
-        template's container, optionally with its tests and security scans. Returns the outcome, the test and scan
-        results, and the last lines of output, including compiler errors."""
+        template's container, optionally with its tests, security scans, complexity metrics and diagrams. Returns the outcome,
+        the check results, and the last lines of output, including compiler errors."""
         return await run_tool(
-            ctx, request("compile", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, keep_temp)
+            ctx, request(
+                "compile", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, complexity,
+                max_complexity, visualize, keep_temp,
+            )
         )
 
     @server.tool(structured_output=False)
@@ -1154,13 +1521,20 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         test_files: TestFiles = None,
         test_source: TestSource = None,
         security_scan: SecurityScan = False,
+        complexity: Complexity = False,
+        max_complexity: MaxComplexity = None,
+        visualize: Visualize = False,
         keep_temp: KeepTemp = False,
     ) -> str:
         """Build a GraalVM native executable with `make build_graalvm` (bal build --graalvm) in a copy of the template
-        project, inside the template's container, optionally with its tests and security scans. Takes several minutes.
+        project, inside the template's container, optionally with its tests, security scans, complexity metrics and
+        diagrams. Takes several minutes.
         The executable is a Linux binary."""
         return await run_tool(
-            ctx, request("graalvm", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, keep_temp)
+            ctx, request(
+                "graalvm", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, complexity,
+                max_complexity, visualize, keep_temp,
+            )
         )
 
     @server.tool(structured_output=False)
@@ -1173,13 +1547,19 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         test_files: TestFiles = None,
         test_source: TestSource = None,
         security_scan: SecurityScan = False,
+        complexity: Complexity = False,
+        max_complexity: MaxComplexity = None,
+        visualize: Visualize = False,
         keep_temp: KeepTemp = False,
     ) -> str:
         """Build a Docker image with `make build_docker` (bal build --cloud=docker) using Docker-in-Docker inside the
         template's container, then save it with `docker save` to a .tar on this machine (load it with docker load -i),
-        optionally with its tests and security scans."""
+        optionally with its tests, security scans, complexity metrics and diagrams."""
         return await run_tool(
-            ctx, request("docker", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, keep_temp)
+            ctx, request(
+                "docker", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, complexity,
+                max_complexity, visualize, keep_temp,
+            )
         )
 
     server.run()
@@ -1187,6 +1567,12 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
 
 
 # --------------------------------------------------------------------------- CLI
+
+
+def _positive_int(text: str) -> int:
+    if not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"expected a whole number of 1 or more, not {text!r}")
+    return int(text)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1200,14 +1586,19 @@ examples:
   bal_builder.py build-graalvm hello.bal -o out                # native executable + .jar -> out/
   bal_builder.py build-docker  hello.bal                       # docker save -> ./hello.tar
   bal_builder.py compile       hello.bal --test --scan -o out  # plus test and scan reports in out/
+  bal_builder.py compile       hello.bal --max-complexity 10   # fail if a function is too complex
+  bal_builder.py compile       hello.bal --visualize -o out    # the VS Code extension's diagrams -> out/visualizations
 
 options of compile, build-graalvm and build-docker (see `bal_builder.py COMMAND -h`):
-  -o DIR           copy the outputs (target/bin, build-docker's .tar, reports) to DIR
-  --test           also run `make test`: bal test with a report and code coverage
-  --test-file FILE add a test file to tests/ (repeatable; implies --test)
-  --scan           also run bal scan (in {SCAN_BALLERINA_IMAGE}) and Trivy (vulnerabilities, SBOM)
-  -k, --keep       keep the temporary folder and the container
-  -t DIR           template folder (default: ${TEMPLATE_ENV}, else this script's folder)
+  -o DIR              copy the outputs (target/bin, build-docker's .tar, reports) to DIR
+  --test              also run `make test`: bal test with a report and code coverage
+  --test-file FILE    add a test file to tests/ (repeatable; implies --test)
+  --scan              also run bal scan (in {SCAN_BALLERINA_IMAGE}) and Trivy (vulnerabilities, SBOM)
+  --complexity        also measure each function's cyclomatic and cognitive complexity
+  --max-complexity N  fail if a function's cyclomatic complexity is over N (implies --complexity)
+  --visualize         also save the Ballerina VS Code extension's diagrams of each file and function (needs -o)
+  -k, --keep          keep the temporary folder and the container
+  -t DIR              template folder (default: ${TEMPLATE_ENV}, else this script's folder)
 
 Build output streams while it runs. After a successful build the temporary folder and the
 container are removed; a failed build keeps the temporary folder and prints its path.""",
@@ -1260,6 +1651,25 @@ container are removed; a failed build keeps the temporary folder and prints its 
         help=f"also run bal scan static analysis in {SCAN_BALLERINA_IMAGE} (-> DIR/scan-report) and Trivy: known"
         " vulnerabilities in the .jar or image plus a CycloneDX SBOM (-> DIR/trivy)",
     )
+    build.add_argument(
+        "--complexity",
+        action="store_true",
+        help="also measure each function's cyclomatic and cognitive complexity, deepest nesting and lines of code with the"
+        " template's own Ballerina parser (-> DIR/complexity)",
+    )
+    build.add_argument(
+        "--max-complexity",
+        type=_positive_int,
+        metavar="N",
+        help="fail if a function's cyclomatic complexity is over N; 10 is a common limit (implies --complexity)",
+    )
+    build.add_argument(
+        "--visualize",
+        action="store_true",
+        help="also save the diagrams the Ballerina VS Code extension draws, drawn by the extension itself in a headless VS Code:"
+        " each file's overview and the sequence diagram, data mapper or service view of each function, method, service and"
+        " resource, as PNG (plus the extension's SVG export of sequence diagrams) with an index.html (-> DIR/visualizations; needs -o)",
+    )
     build.add_argument("-k", "--keep", action="store_true", help="leave the temporary folder and the container, and print where they are")
 
     commands.add_parser("compile", parents=[common, build], help="run `make build` (bal build)")
@@ -1288,6 +1698,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         tests=args.test,
         test_files=args.test_file,
         scan=args.scan,
+        complexity=args.complexity,
+        max_complexity=args.max_complexity,
+        visualize=args.visualize,
     )
 
     def interrupt(signum: int, frame: object) -> None:

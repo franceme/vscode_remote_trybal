@@ -1,0 +1,14 @@
+{
+  "name": "bal-visualizer-driver",
+  "displayName": "bal_builder visualizer driver",
+  "description": "Opens the Ballerina extension's diagrams one at a time for bal_builder.py --visualize.",
+  "publisher": "bal-builder",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.73.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js"
+}
