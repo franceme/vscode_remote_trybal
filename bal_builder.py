@@ -578,8 +578,9 @@ def _check_docker() -> None:
 
 
 def _failure_hint(mode: str, tail: Deque[str]) -> str:
-    if mode == "graalvm" and any("Error 137" in line or line.strip() == "Killed" for line in tail):
-        return "native-image was killed, most likely for lack of memory: give Docker more memory and retry."
+    out_of_memory = ("Error 137", "ran out of memory")  # killed by the kernel, or native-image's own message
+    if mode == "graalvm" and any(any(text in line for text in out_of_memory) or line.strip() == "Killed" for line in tail):
+        return "native-image ran out of memory: give Docker more memory (or stop other builds) and retry."
     return ""
 
 
@@ -732,6 +733,8 @@ def _trivy(req: BuildRequest, docker: _Docker, out: _Output, container: str, rep
         source, label, target = req.tar_path, req.tar_path.name, ["image", "--input", f"/scan/{req.tar_path.name}"]
     else:  # target/bin: the libraries packed into the executable jar
         source, label, target = _bin_dir(docker, container, tmp), "target/bin", ["rootfs", "/scan"]
+    # Ballerina images always contain jars; target/bin holds the executable .jar unless the Makefile changed.
+    expects_jar = req.mode == "docker" or any(path.suffix == ".jar" for path in source.iterdir())
     quiet = ["--disable-telemetry", "--skip-version-check"]  # no usage data sent to Aqua, no update notices
     docker.ensure_image(TRIVY_IMAGE)
     with docker.helper(TRIVY_IMAGE, "trivy", volumes=(f"{TRIVY_CACHE_VOLUME}:/root/.cache",)) as trivy:
@@ -746,14 +749,17 @@ def _trivy(req: BuildRequest, docker: _Docker, out: _Output, container: str, rep
             if returncode != 0:
                 return f"Trivy failed with exit code {returncode}"
             data = json.loads(docker.run("exec", trivy, "cat", "/report/vulnerabilities.json").stdout)
-            packages = sum(len(item.get("Packages") or []) for item in data.get("Results") or [])
-            if packages:
+            results = data.get("Results") or []
+            packages = sum(len(item.get("Packages") or []) for item in results)
+            if packages and (not expects_jar or any(item.get("Type") == "jar" for item in results)):
                 break
-            # A .jar or an image always has packages, so none means Trivy analysed nothing (seen once, intermittently).
+            # Trivy skips a jar silently (logging only with --debug) when its cached Java database is damaged,
+            # as seen with a download that left `database disk image is malformed` pages. Get a fresh one.
             if attempt == 0:
-                out.status("Trivy found no packages to check; scanning once more")
+                out.status("Trivy analysed no .jar files, so its Java database is probably damaged; clearing it and scanning again (about a 1 GB download)")
+                docker.run("exec", trivy, "trivy", "clean", "--java-db")
         else:
-            return f"Trivy found no packages to check in {label}"
+            return f"Trivy could not analyse the .jar files in {label}" if expects_jar else f"Trivy found no packages to check in {label}"
         for format_, name in (("table", "vulnerabilities.txt"), ("cyclonedx", "sbom.cdx.json")):  # from the JSON, no rescan
             docker.run("exec", trivy, "trivy", "convert", "--quiet", "--format", format_, "--output", f"/report/{name}", "/report/vulnerabilities.json")
         docker.run("cp", f"{trivy}:/report/.", str(reports / "trivy"))
