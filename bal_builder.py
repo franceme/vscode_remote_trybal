@@ -8,9 +8,10 @@
 One script, two front ends that share the same build code:
 
   CLI (Python 3.9+, needs nothing but Docker):
-    python3 bal_builder.py compile       hello.bal -o out  # make build         (bal build), the .jar -> out/
-    python3 bal_builder.py build-graalvm hello.bal -o out  # make build_graalvm (bal build --graalvm), native executable + .jar -> out/
-    python3 bal_builder.py build-docker  hello.bal         # make build_docker  (bal build --cloud=docker), docker save -> ./hello.tar
+    python3 bal_builder.py compile       hello.bal -o out  # make build         (bal build), the .jar -> out/main.jar
+    python3 bal_builder.py build-graalvm hello.bal -o out  # make build_graalvm (bal build --graalvm), native executable + .jar -> out/main, out/main.jar
+    python3 bal_builder.py build-docker  hello.bal         # make build_docker  (bal build --cloud=docker), docker save -> ./main.tar
+    python3 bal_builder.py compile hello.bal -o out --name hello    # the outputs named hello: out/hello.jar
     python3 bal_builder.py compile hello.bal --test --scan -o out  # also tests and security scans, reports -> out/
     python3 bal_builder.py compile hello.bal --complexity           # also complexity metrics per function
     python3 bal_builder.py run hello.bal a b                        # build, then run the program with a b
@@ -35,7 +36,7 @@ Makefile target builds with them, and the build fails if it used another version
 
 -o / --output DIR (MCP: output_dir) copies a build's outputs out of the container, so they outlive the
 temporary copy: target/bin (the executable .jar, plus the native executable for build-graalvm),
-build-docker's image .tar (saved as ./<file name>.tar without -o) and the reports of these checks:
+build-docker's image .tar (saved in the current folder without -o) and the reports of these checks:
   --test  `make test`: bal test with a test report and code coverage                  -> test-report/
   --scan  bal scan static analysis, run in a newer Ballerina image                     -> scan-report/
           and Trivy: vulnerabilities and a CycloneDX SBOM of the .jar or the image     -> trivy/
@@ -44,6 +45,10 @@ build-docker's image .tar (saved as ./<file name>.tar without -o) and the report
   --visualize  the Ballerina VS Code extension's diagrams of each file, function and service
           (overview, sequence diagram, data mapper), drawn by the extension (bal_visualizer/) -> visualizations/
 Their results are also summarised at the end of the run.
+
+The outputs are named main rather than after the template's package: main.jar, build-graalvm's native
+executable main, and build-docker's image main:latest saved as main.tar. --name NAME (MCP: output_name)
+names them NAME instead (the image in lowercase).
 
 After a successful build the temporary folder and the container are removed. --keep (MCP: keep_temp)
 leaves both in place and prints where they are. A failed or cancelled build always keeps the
@@ -85,7 +90,15 @@ LABEL = "bal-builder"  # label on every container and template image this script
 
 # capability -> Makefile target in the template
 MAKE_TARGETS = {"compile": "build", "graalvm": "build_graalvm", "docker": "build_docker", "run": "build"}
-RUN_PROGRAM = 'exec bal run target/bin/*.jar -- "$@"'  # run: the built jar, with the program's arguments
+# run: the built jar, with the program's arguments as `java -jar` would pass them. Not after a `--`: `bal run` passes
+# that on to the program, where it ends the options, so `--name value` could not set an option of main.
+RUN_PROGRAM = 'exec bal run target/bin/*.jar "$@"'
+
+# The outputs are renamed from the package's name (Ballerina.toml) to this one, or to --name's (MCP: output_name):
+# NAME.jar, the native executable NAME, and the Docker image NAME:<tag>, saved as NAME.tar.
+OUTPUT_NAME = "main"
+OUTPUT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+IMAGE_NAME_PATTERN = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*")  # a Docker image name's last path component
 
 # --complexity: the analyser, next to this script (its README explains the rules and how to update them).
 COMPLEXITY_DIR = SCRIPT_PATH.parent / "bal_complexity"
@@ -178,6 +191,7 @@ class BuildRequest:
     rebuild_image: bool = False  # rebuild the template image (pulling its base) even if .devcontainer is unchanged
     keep: bool = False  # leave the temporary folder and the container in place
     output_dir: Optional[Path] = None  # copy target/bin, docker's image .tar and the check reports here
+    name: str = OUTPUT_NAME  # the outputs' name: NAME.jar, the native executable NAME, the image NAME saved as NAME.tar
     tests: bool = False  # also run `make test` (bal test with a report and code coverage)
     test_files: List[Path] = dataclasses.field(default_factory=list)  # added to tests/ (implies tests)
     test_source: Optional[str] = None  # written to tests/main_test.bal (implies tests)
@@ -186,7 +200,7 @@ class BuildRequest:
     max_complexity: Optional[int] = None  # fail when a function's cyclomatic complexity is higher (implies complexity)
     visualize: bool = False  # also save the VS Code extension's diagrams of each file and function (needs output_dir)
     program_args: List[str] = dataclasses.field(default_factory=list)  # run: the arguments of the program
-    tar_path: Optional[Path] = None  # docker: set by _normalized to <output_dir or .>/<file stem>.tar
+    tar_path: Optional[Path] = None  # docker: set by _normalized to <output_dir or .>/<name>.tar
     dependencies: List["Dependency"] = dataclasses.field(default_factory=list)  # set by _normalized from `// dependency:` comments
 
 
@@ -744,7 +758,16 @@ def _normalized(req: BuildRequest) -> BuildRequest:
     bal_file = req.bal_file.expanduser().resolve() if req.bal_file is not None else None
     if bal_file is not None and not bal_file.is_file():
         raise BuildError(f"No such file: {bal_file}")
-    stem = bal_file.stem if bal_file is not None else "main"
+    if not OUTPUT_NAME_PATTERN.fullmatch(req.name):
+        raise BuildError(
+            f"The output name {req.name!r} is not a file name: use letters, digits, '.', '_' and '-', starting with a letter"
+            " or digit, and no extension (the outputs are NAME.jar, NAME and NAME.tar)."
+        )
+    if req.mode == "docker" and not IMAGE_NAME_PATTERN.fullmatch(req.name.lower()):
+        raise BuildError(
+            f"The output name {req.name!r} cannot name a Docker image: separate letters and digits with single '.' or '_',"
+            " '__', or dashes, and start and end with a letter or digit."
+        )
     if bal_file is not None:
         dependencies = _declared_dependencies(bal_file.read_text(encoding="utf-8"), str(req.bal_file))
     else:
@@ -772,7 +795,7 @@ def _normalized(req: BuildRequest) -> BuildRequest:
         tests=req.tests or bool(test_files) or req.test_source is not None,
         test_files=test_files,
         complexity=req.complexity or req.max_complexity is not None,
-        tar_path=(output_dir or Path.cwd()) / f"{stem}.tar" if req.mode == "docker" else None,
+        tar_path=(output_dir or Path.cwd()) / f"{req.name}.tar" if req.mode == "docker" else None,
         dependencies=dependencies,
     )
 
@@ -1236,12 +1259,30 @@ def _visualize(req: BuildRequest, docker: _Docker, out: _Output, project: Path, 
     return f"{_plural(len(failed), 'diagram')} could not be captured" if failed else None
 
 
+def _renamed_image(image: str, name: str) -> str:
+    """`image` named `name`, in lowercase as Docker requires, keeping its registry, repository path and tag."""
+    path, slash, last = image.rpartition("/")
+    return f"{path}{slash}{name.lower()}:{last.partition(':')[2] or 'latest'}"
+
+
+def _output_name(file_name: str, packages: set, name: str) -> str:
+    """A file of target/bin renamed: Ballerina names them after the package (vscode_remote_trybal.jar, the native
+    executable vscode_remote_trybal, ...), and the copies are named `name` instead (main.jar, main, ...)."""
+    for package in sorted(packages, key=len, reverse=True):  # package names can contain dots
+        if file_name == package or file_name.startswith(package + "."):
+            return name + file_name[len(package):]
+    return file_name
+
+
 def _copy_outputs(req: BuildRequest, docker: _Docker, out: _Output, container: str, reports: Path, tmp: Path, result: BuildResult) -> None:
-    out.status(f"Copying the outputs to {req.output_dir}")
+    out.status(f"Copying the outputs to {req.output_dir}, named {req.name}")
     req.output_dir.mkdir(parents=True, exist_ok=True)
-    for path in sorted(_bin_dir(docker, container, tmp).iterdir()):
-        shutil.copy2(path, req.output_dir / path.name)
-        result.artifacts.append(str(req.output_dir / path.name))
+    bin_dir = _bin_dir(docker, container, tmp)
+    packages = {path.stem for path in bin_dir.glob("*.jar")}  # the executable jar is <package>.jar
+    for path in sorted(bin_dir.iterdir()):
+        copy = req.output_dir / _output_name(path.name, packages, req.name)
+        shutil.copy2(path, copy)
+        result.artifacts.append(str(copy))
     for report in sorted(reports.iterdir()):
         shutil.copytree(report, req.output_dir / report.name, dirs_exist_ok=True)
         result.reports.append(str(req.output_dir / report.name))
@@ -1295,7 +1336,11 @@ def run_build(req: BuildRequest, reporter: Reporter, cancel: Optional[CancelToke
                 result.message = _failure_hint(req.mode, out.tail)
         if result.exit_code == 0:
             if req.mode == "docker":
-                result.docker_image = docker.built_image(container, list(out.tail))
+                built = docker.built_image(container, list(out.tail))
+                result.docker_image = _renamed_image(built, req.name)
+                if result.docker_image != built:
+                    out.status(f"Tagging the image {built} as {result.docker_image}")
+                    docker.run("exec", container, "docker", "tag", built, result.docker_image)
                 docker.save(container, result.docker_image, req.tar_path)
                 result.image_tar = str(req.tar_path)
             reports = tmp / "reports"
@@ -1592,6 +1637,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         bal_file: Optional[str],
         source: Optional[str],
         output_dir: Optional[str],
+        output_name: Optional[str],
         run_tests: bool,
         test_files: Optional[List[str]],
         test_source: Optional[str],
@@ -1611,6 +1657,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
             rebuild_image=rebuild,
             keep=keep_temp,
             output_dir=Path(output_dir) if output_dir else None,
+            name=output_name or OUTPUT_NAME,
             tests=run_tests,
             test_files=[Path(path) for path in test_files or []],
             test_source=test_source,
@@ -1634,7 +1681,15 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         Field(
             description="Folder to copy the outputs to, so they outlive the temporary copy: target/bin (the executable .jar, plus"
             " the native executable for build_graalvm), build_docker's image .tar, the reports of run_tests, security_scan"
-            " and complexity, and the diagrams of visualize. Without it, build_docker saves the .tar as ./<file name>.tar and the checks are only summarised."
+            " and complexity, and the diagrams of visualize. Without it, build_docker saves the .tar in the current folder"
+            " and the checks are only summarised."
+        ),
+    ]
+    OutputName = Annotated[
+        Optional[str],
+        Field(
+            description=f"Name of the outputs, in place of the template package's: NAME.jar, build_graalvm's native executable"
+            f" NAME, and build_docker's image NAME (lowercased) saved as NAME.tar. Default: {OUTPUT_NAME}."
         ),
     ]
     RunTests = Annotated[
@@ -1704,6 +1759,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         bal_file: BalFile = None,
         source: Source = None,
         output_dir: OutputDir = None,
+        output_name: OutputName = None,
         run_tests: RunTests = False,
         test_files: TestFiles = None,
         test_source: TestSource = None,
@@ -1718,7 +1774,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         the check results, and the last lines of output, including compiler errors."""
         return await run_tool(
             ctx, request(
-                "compile", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, complexity,
+                "compile", bal_file, source, output_dir, output_name, run_tests, test_files, test_source, security_scan, complexity,
                 max_complexity, visualize, keep_temp,
             )
         )
@@ -1729,6 +1785,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         bal_file: BalFile = None,
         source: Source = None,
         output_dir: OutputDir = None,
+        output_name: OutputName = None,
         run_tests: RunTests = False,
         test_files: TestFiles = None,
         test_source: TestSource = None,
@@ -1744,7 +1801,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         The executable is a Linux binary."""
         return await run_tool(
             ctx, request(
-                "graalvm", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, complexity,
+                "graalvm", bal_file, source, output_dir, output_name, run_tests, test_files, test_source, security_scan, complexity,
                 max_complexity, visualize, keep_temp,
             )
         )
@@ -1755,6 +1812,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         bal_file: BalFile = None,
         source: Source = None,
         output_dir: OutputDir = None,
+        output_name: OutputName = None,
         run_tests: RunTests = False,
         test_files: TestFiles = None,
         test_source: TestSource = None,
@@ -1769,7 +1827,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         optionally with its tests, security scans, complexity metrics and diagrams."""
         return await run_tool(
             ctx, request(
-                "docker", bal_file, source, output_dir, run_tests, test_files, test_source, security_scan, complexity,
+                "docker", bal_file, source, output_dir, output_name, run_tests, test_files, test_source, security_scan, complexity,
                 max_complexity, visualize, keep_temp,
             )
         )
@@ -1794,9 +1852,10 @@ def _parser() -> argparse.ArgumentParser:
         description="Build a Ballerina file in a temporary copy of a template project, inside the template's container.",
         epilog=f"""\
 examples:
-  bal_builder.py compile       hello.bal -o out                # the .jar -> out/
-  bal_builder.py build-graalvm hello.bal -o out                # native executable + .jar -> out/
-  bal_builder.py build-docker  hello.bal                       # docker save -> ./hello.tar
+  bal_builder.py compile       hello.bal -o out                # the .jar -> out/main.jar
+  bal_builder.py build-graalvm hello.bal -o out                # native executable + .jar -> out/main, out/main.jar
+  bal_builder.py build-docker  hello.bal                       # docker save -> ./main.tar
+  bal_builder.py compile       hello.bal -o out --name hello   # the outputs named hello: out/hello.jar
   bal_builder.py compile       hello.bal --test --scan -o out  # plus test and scan reports in out/
   bal_builder.py compile       hello.bal --max-complexity 10   # fail if a function is too complex
   bal_builder.py compile       hello.bal --visualize -o out    # the VS Code extension's diagrams -> out/visualizations
@@ -1816,6 +1875,7 @@ dependencies: comments in the file pin the versions of the packages it uses (exa
 
 options of compile, build-graalvm, build-docker and run (see `bal_builder.py COMMAND -h`):
   -o DIR              copy the outputs (target/bin, build-docker's .tar, reports) to DIR
+  --name NAME         name the outputs NAME.jar, NAME (native executable), NAME.tar (default: {OUTPUT_NAME})
   --test              also run `make test`: bal test with a report and code coverage
   --test-file FILE    add a test file to tests/ (repeatable; implies --test)
   --scan              also run bal scan (in {SCAN_BALLERINA_IMAGE}) and Trivy (vulnerabilities, SBOM)
@@ -1880,7 +1940,13 @@ def _build_options() -> argparse.ArgumentParser:
         type=Path,
         metavar="DIR",
         help="copy the outputs here, so they outlive the temporary copy: target/bin (the executable .jar, plus the native"
-        " executable for build-graalvm), build-docker's image .tar (otherwise saved as ./<file name>.tar) and the check reports",
+        " executable for build-graalvm), build-docker's image .tar (otherwise saved in the current folder) and the check reports",
+    )
+    build.add_argument(
+        "--name",
+        default=OUTPUT_NAME,
+        help=f"name of the outputs, in place of the package's: NAME.jar, build-graalvm's native executable NAME, and"
+        f" build-docker's image NAME (lowercased, tag kept) saved as NAME.tar (default: {OUTPUT_NAME})",
     )
     build.add_argument(
         "--test", action="store_true", help="also run `make test`: bal test with a test report and code coverage (-> DIR/test-report)"
@@ -1997,6 +2063,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         rebuild_image=args.rebuild_image,
         keep=args.keep,
         output_dir=args.output,
+        name=args.name,
         tests=args.test,
         test_files=args.test_file,
         scan=args.scan,
