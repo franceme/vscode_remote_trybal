@@ -38,6 +38,27 @@ Each run copies this folder (or `--template DIR` / `$BAL_BUILDER_TEMPLATE`) to a
 
 The results are also summarised at the end of each run. Failing tests, a function over `--max-complexity`, a diagram that could not be captured, or a check that cannot run make the run fail; scan findings do not. The first `--scan` downloads the scan image and Trivy's databases, which are kept in the `bal-builder-trivy-cache` Docker volume. The first `--visualize` builds two images (code-server with the extension, and a Playwright browser; about 2 GB to download).
 
+### Pinned dependencies
+
+`// dependency: org/name:version` comments pin the versions of the packages a file uses. Without them, Ballerina picks the version: the one bundled with the distribution, or the newest compatible one on Ballerina Central.
+
+```ballerina
+// dependency: ballerina/toml:0.3.0
+// dependency: ballerina/uuid:1.5.0
+import ballerina/toml;
+import ballerina/uuid;
+```
+
+- The pins are written to the `Dependencies.toml` of the temporary copy. If the template's `Dependencies.toml` belongs to this package, it is kept and the pinned packages replace their entries in it. Otherwise Ballerina would ignore that file, so a new one is written.
+- Before the Makefile target, `bal build --sticky` pulls the pinned versions from Ballerina Central. Ballerina then keeps that resolution, so `make` (and `make test` for `--test`) builds with the same versions. A plain `bal build` would move to the newest compatible versions instead.
+- After the build, the summary lists the version of each pinned package that the build used. The run fails if one differs from its pin, or if the build doesn't use a pinned package at all (nothing imports it, directly or through another package). With `run`, the program then doesn't start.
+- A pin can also name a package that the file uses only through another package, such as `ballerina/crypto` through `ballerina/uuid`.
+- If Ballerina Central doesn't have a pinned version, `bal build --sticky` fails, and Ballerina reports it as `cannot resolve module`. A comment that isn't of the form `org/name:version`, or two different pins for one package, stops the run before it starts.
+- Pins compile the file twice (`bal build --sticky`, then the Makefile target) and pull the pinned packages on every run, because each run uses a fresh container.
+- The comments work the same in `#!` scripts and in MCP `source`.
+
+[examples/main_dependencies.bal](examples/main_dependencies.bal) pins `ballerina/toml` 0.3.0 and `ballerina/uuid` 1.5.0. Ballerina 2201.7.1 bundles toml 0.4.0 and uuid 1.6.0, and Central also has uuid 1.5.1. `python3 bal_builder.py run examples/main_dependencies.bal` prints a UUID for each service in a TOML document. `compile` ends with `Dependencies (// dependency: comments): ballerina/toml 0.3.0, ballerina/uuid 1.5.0 as declared.`
+
 ### Ballerina scripts
 
 With a `#!` first line, a `.bal` file runs like a script: it is built in a copy of this project, and then run with the arguments it was given.
@@ -71,4 +92,4 @@ claude mcp add ballerina-builder -- uv run /path/to/bal_builder.py mcp        # 
 claude mcp add ballerina-builder -- python3.13 /path/to/bal_builder.py mcp    # after: python3.13 -m pip install mcp
 ```
 
-Its tools `compile_ballerina`, `build_graalvm` and `build_docker` take `bal_file` (a path) or `source` (the code), plus `output_dir`, `run_tests`, `test_files`, `test_source`, `security_scan`, `complexity`, `max_complexity`, `visualize` and `keep_temp`. Build output streams as MCP progress notifications.
+Its tools `compile_ballerina`, `build_graalvm` and `build_docker` take `bal_file` (a path) or `source` (the code, which can pin dependencies with `// dependency:` comments), plus `output_dir`, `run_tests`, `test_files`, `test_source`, `security_scan`, `complexity`, `max_complexity`, `visualize` and `keep_temp`. Build output streams as MCP progress notifications.

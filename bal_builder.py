@@ -29,6 +29,10 @@ container from the template's dev-container image (.devcontainer/), copies the p
 Makefile target and streams its output while it runs. The template is re-read on every build, so
 changes to it apply straight away.
 
+`// dependency: org/name:version` comments in the file pin the versions of the packages it uses: they are
+locked in the copy's Dependencies.toml, `bal build --sticky` pulls them from Ballerina Central before the
+Makefile target builds with them, and the build fails if it used another version (examples/main_dependencies.bal).
+
 -o / --output DIR (MCP: output_dir) copies a build's outputs out of the container, so they outlive the
 temporary copy: target/bin (the executable .jar, plus the native executable for build-graalvm),
 build-docker's image .tar (saved as ./<file name>.tar without -o) and the reports of these checks:
@@ -183,6 +187,7 @@ class BuildRequest:
     visualize: bool = False  # also save the VS Code extension's diagrams of each file and function (needs output_dir)
     program_args: List[str] = dataclasses.field(default_factory=list)  # run: the arguments of the program
     tar_path: Optional[Path] = None  # docker: set by _normalized to <output_dir or .>/<file stem>.tar
+    dependencies: List["Dependency"] = dataclasses.field(default_factory=list)  # set by _normalized from `// dependency:` comments
 
 
 @dataclasses.dataclass
@@ -193,6 +198,7 @@ class BuildResult:
     message: str = ""
     problems: List[str] = dataclasses.field(default_factory=list)  # failed checks (the build itself worked)
     exit_code: Optional[int] = None
+    failed_step: Optional[str] = None  # the command that failed, when it ran before the Makefile target
     seconds: float = 0.0
     artifacts: List[str] = dataclasses.field(default_factory=list)  # files written outside the temporary folder
     reports: List[str] = dataclasses.field(default_factory=list)  # report folders written to output_dir
@@ -203,6 +209,7 @@ class BuildResult:
     vulnerabilities: Optional[dict] = None  # summary of Trivy's report
     complexity: Optional[dict] = None  # summary of BalComplexity's report
     visualizations: Optional[dict] = None  # summary of the captured diagrams
+    dependencies: Optional[List[list]] = None  # [package, declared version, version the build used] per `// dependency:`
     program_exit_code: Optional[int] = None  # run: the program's exit code, once it has run
     temp_dir: Optional[str] = None  # set when the temporary folder was left in place
     container: Optional[str] = None  # set when the container was left in place
@@ -594,6 +601,134 @@ def _template_image(req: BuildRequest, docker: _Docker, out: _Output) -> str:
     return tag
 
 
+# --------------------------------------------------------------------------- dependencies (// dependency: comments)
+
+
+@dataclasses.dataclass(frozen=True)
+class Dependency:
+    """A package version pinned with a `// dependency: org/name:version` comment in the built file."""
+
+    org: str
+    name: str
+    version: str
+    modules: tuple = ()  # the modules of the package that the file imports, e.g. ("toml",) or ("aws.s3",)
+
+
+DEPENDENCY_COMMENT = re.compile(r"^[ \t]*//[ \t]*dependency:(.*)$", re.M)
+DEPENDENCY_SPEC = re.compile(r"\s*([A-Za-z0-9_]+)/([A-Za-z0-9_.]+):(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*")
+IMPORT = re.compile(r"^[ \t]*import[ \t]+([A-Za-z0-9_]+)/([A-Za-z0-9_.]+)", re.M)
+
+
+def _declared_dependencies(source: str, source_name: str) -> List[Dependency]:
+    """The versions pinned by the file's `// dependency:` comments, each with the modules of it the file imports."""
+    declared: Dict[tuple, Dependency] = {}
+    for match in DEPENDENCY_COMMENT.finditer(source):
+        where = f"{source_name}:{source.count(chr(10), 0, match.start()) + 1}"
+        spec = DEPENDENCY_SPEC.fullmatch(match.group(1))
+        if spec is None:
+            raise BuildError(
+                f"{where}: `{match.group(0).strip()}` should read `// dependency: org/name:version`,"
+                " for example `// dependency: ballerina/toml:0.3.0`."
+            )
+        org, name, version = spec.groups()
+        earlier = declared.get((org, name))
+        if earlier is not None and earlier.version != version:
+            raise BuildError(f"{where}: {org}/{name} is declared twice, as {earlier.version} and {version}.")
+        declared[(org, name)] = Dependency(org, name, version)
+    modules = collections.defaultdict(list)
+    for org, module in sorted(set(IMPORT.findall(source))):
+        # `import ballerinax/aws.s3` is package aws.s3 if that is declared, else module s3 of a declared aws.
+        owners = [dep for dep in declared.values() if dep.org == org and (module == dep.name or module.startswith(dep.name + "."))]
+        if owners:
+            modules[max(owners, key=lambda dep: len(dep.name))].append(module)
+    return [dataclasses.replace(dep, modules=tuple(modules[dep])) for dep in declared.values()]
+
+
+_LOCK_TABLES = re.compile(r"(?m)^(?=\[\[package\]\])")
+
+
+def _toml_value(text: str, key: str) -> Optional[str]:
+    """The string `key = "..."` of a TOML table written the way Ballerina writes them, one key per line."""
+    match = re.search(rf'(?m)^{re.escape(key)}\s*=\s*"([^"]*)"', text)
+    return match.group(1) if match else None
+
+
+def _toml_array(text: str, key: str) -> str:
+    """The items of a `key = [ ... ]` array written over several lines, as Ballerina writes them."""
+    match = re.search(rf"(?ms)^{re.escape(key)}\s*=\s*\[\n(.*?)^\]", text)
+    return match.group(1) if match else ""
+
+
+def _lock_entries(lock: str) -> Dict[tuple, str]:
+    """The [[package]] tables of a Dependencies.toml, by (org, name)."""
+    return {(_toml_value(table, "org") or "", _toml_value(table, "name") or ""): table.strip() for table in _LOCK_TABLES.split(lock)[1:]}
+
+
+def _package_table(org: str, name: str, version: str, dependencies=(), modules=()) -> str:
+    lines = ["[[package]]", f'org = "{org}"', f'name = "{name}"', f'version = "{version}"']
+    if dependencies:
+        lines += ["dependencies = [", ",\n".join(f'\t{{org = "{o}", name = "{n}"}}' for o, n in sorted(dependencies)), "]"]
+    if modules:
+        lines += ["modules = [", ",\n".join(f'\t{{org = "{org}", packageName = "{name}", moduleName = "{m}"}}' for m in modules), "]"]
+    return "\n".join(lines)
+
+
+def _dependencies_toml(lock: str, package: tuple, distribution: str, source_name: str, deps: List[Dependency]) -> str:
+    """The template's Dependencies.toml with the declared versions locked in it.
+
+    Ballerina only honours a locked version when the lock lists the package being built (with the dependency among
+    its own when the code imports it), names the modules imported from the dependency, and was written for the
+    running distribution; otherwise it resolves the newest compatible version.
+    """
+    org, name, version = package
+    entries = _lock_entries(lock)
+    root = entries.pop((org, name), "")  # the template's lock is its own only if it lists the package
+    if not root:
+        entries = {}  # another package's lock (or none at all), which Ballerina ignores
+    root_dependencies = set(re.findall(r'\{org = "([^"]+)", name = "([^"]+)"\}', _toml_array(root, "dependencies")))
+    root_modules = re.findall(r'moduleName = "([^"]+)"', _toml_array(root, "modules"))
+    for dep in deps:
+        entries[(dep.org, dep.name)] = _package_table(dep.org, dep.name, dep.version, modules=dep.modules)
+        if dep.modules:
+            root_dependencies.add((dep.org, dep.name))
+    entries[(org, name)] = _package_table(org, name, version, root_dependencies, root_modules)
+    header = (
+        f"# Written by bal_builder.py, to lock the versions pinned by the `// dependency:` comments of {source_name}."
+        f"\n\n[ballerina]\ndependencies-toml-version = \"2\"\ndistribution-version = \"{distribution}\""
+    )
+    return "\n\n".join([header, *(entries[key] for key in sorted(entries))]) + "\n"
+
+
+def _lock_dependencies(req: BuildRequest, docker: _Docker, out: _Output, container: str, project: Path) -> None:
+    """Lock the declared versions in the copy's Dependencies.toml, for the distribution in the build container."""
+    manifest = re.search(r"(?ms)^\[package\][ \t]*\n(.*?)(?=^\[|\Z)", (project / "Ballerina.toml").read_text(encoding="utf-8"))
+    package = tuple(_toml_value(manifest.group(1), key) if manifest else None for key in ("org", "name", "version"))
+    if not all(package):
+        raise BuildError("Pinning dependencies needs the org, name and version of [package] in the template's Ballerina.toml.")
+    found = re.search(r"Ballerina (\d+\.\d+\.\d+)", docker.run("exec", container, "bal", "version").stdout)
+    if found is None:
+        raise BuildError("`bal version` in the build container did not name a Ballerina distribution.")
+    path = project / "Dependencies.toml"
+    lock = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if lock and (package[0], package[1]) not in _lock_entries(lock):
+        out.status(f"The template's Dependencies.toml does not list {package[0]}/{package[1]}, so Ballerina ignores it; starting a new one")
+    source_name = req.bal_file.name if req.bal_file is not None else "the given source"
+    path.write_text(_dependencies_toml(lock, package, found.group(1), source_name, req.dependencies), encoding="utf-8")
+    pinned = ", ".join(f"{dep.org}/{dep.name}:{dep.version}" for dep in req.dependencies)
+    out.status(f"Locked the declared dependencies in Dependencies.toml (Ballerina {found.group(1)}): {pinned}")
+
+
+def _check_dependencies(req: BuildRequest, docker: _Docker, container: str, result: BuildResult) -> Optional[str]:
+    """Whether the build used each declared version, as its Dependencies.toml records."""
+    lock = docker.run("exec", container, "cat", f"{WORKDIR}/Dependencies.toml").stdout
+    used = {key: _toml_value(table, "version") for key, table in _lock_entries(lock).items()}
+    result.dependencies = [[f"{dep.org}/{dep.name}", dep.version, used.get((dep.org, dep.name))] for dep in req.dependencies]
+    wrong = [package for package, declared, version in result.dependencies if version != declared]
+    if wrong:
+        return f"the build did not use the declared version of {', '.join(wrong)}"
+    return None
+
+
 # --------------------------------------------------------------------------- build
 
 
@@ -610,6 +745,10 @@ def _normalized(req: BuildRequest) -> BuildRequest:
     if bal_file is not None and not bal_file.is_file():
         raise BuildError(f"No such file: {bal_file}")
     stem = bal_file.stem if bal_file is not None else "main"
+    if bal_file is not None:
+        dependencies = _declared_dependencies(bal_file.read_text(encoding="utf-8"), str(req.bal_file))
+    else:
+        dependencies = _declared_dependencies(req.source, "source")
     test_files = [Path(path).expanduser().resolve() for path in req.test_files]
     for path in test_files:
         if not path.is_file():
@@ -634,6 +773,7 @@ def _normalized(req: BuildRequest) -> BuildRequest:
         test_files=test_files,
         complexity=req.complexity or req.max_complexity is not None,
         tar_path=(output_dir or Path.cwd()) / f"{stem}.tar" if req.mode == "docker" else None,
+        dependencies=dependencies,
     )
 
 
@@ -1130,22 +1270,38 @@ def run_build(req: BuildRequest, reporter: Reporter, cancel: Optional[CancelToke
             _RUNNING[container] = cancel
         out.status(f"Starting container {container} from {image}")
         docker.start(image, container, docker_in_docker=req.mode == "docker")
+        if req.dependencies:
+            _lock_dependencies(req, docker, out, container, project)
         docker.copy_in(project, container, image)
         if req.mode == "docker":
             docker.wait_for_daemon(container)
 
-        out.status(f"Running `make {target}` in {container}:{WORKDIR}")
         out.tail.clear()  # the result reports the build itself, not the image preparation
-        result.exit_code = docker.stream("exec", "--workdir", WORKDIR, container, "make", target)
-        if result.exit_code != 0:
-            result.message = _failure_hint(req.mode, out.tail)
-        else:
+        if req.dependencies:
+            # `bal build` alone would move to the newest compatible versions. A sticky build pulls the locked ones, and
+            # Ballerina keeps a package's resolution for 24 hours after it built it, so `make` builds with them too.
+            out.status("Resolving the declared dependencies with `bal build --sticky`, which keeps the locked versions")
+            result.exit_code = docker.stream("exec", "--workdir", WORKDIR, container, "bal", "build", "--sticky")
+            if result.exit_code != 0:
+                result.failed_step = "bal build --sticky"
+                result.message = (
+                    f"It resolves the versions pinned with `// dependency:` comments, before `make {target}`. Ballerina"
+                    " reports a version that Ballerina Central does not have as `cannot resolve module`."
+                )
+        if not result.exit_code:
+            out.status(f"Running `make {target}` in {container}:{WORKDIR}")
+            result.exit_code = docker.stream("exec", "--workdir", WORKDIR, container, "make", target)
+            if result.exit_code != 0:
+                result.message = _failure_hint(req.mode, out.tail)
+        if result.exit_code == 0:
             if req.mode == "docker":
                 result.docker_image = docker.built_image(container, list(out.tail))
                 docker.save(container, result.docker_image, req.tar_path)
                 result.image_tar = str(req.tar_path)
             reports = tmp / "reports"
             reports.mkdir()
+            if req.dependencies:
+                result.problems += _checked("The dependency check", lambda: _check_dependencies(req, docker, container, result))
             if req.scan:
                 result.problems += _checked("bal scan", lambda: _bal_scan(req, docker, out, project, reports, tmp, result))
                 result.problems += _checked("Trivy", lambda: _trivy(req, docker, out, container, reports, tmp, result))
@@ -1207,8 +1363,19 @@ def _plural(count: int, singular: str, plural: Optional[str] = None) -> str:
 
 
 def _check_lines(result: BuildResult) -> List[str]:
-    """Summaries of the --test, --scan and --complexity results."""
+    """Summaries of the dependency check and of the --test, --scan and --complexity results."""
     lines = []
+    if result.dependencies is not None:
+        pinned = [f"{package} {declared}" for package, declared, used in result.dependencies if used == declared]
+        others = len(result.dependencies) - len(pinned)
+        lines.append(
+            f"Dependencies (// dependency: comments): {', '.join(pinned) or 'none'} as declared" + (f"; {others} not." if others else ".")
+        )
+        for package, declared, used in result.dependencies:
+            if used is None:
+                lines.append(f"  {package}: declared {declared}, but the build does not use it (nothing imports it, directly or through another package)")
+            elif used != declared:
+                lines.append(f"  {package}: declared {declared}, but the build used {used}")
     tests = result.tests
     if tests is not None and not tests["total"]:
         lines.append("Tests: none found (add them to the template's tests/ folder, or pass --test-file).")
@@ -1295,7 +1462,8 @@ def format_result(result: BuildResult, output_lines: int = 0) -> str:
         verdict = "failed"
     exit_code = f" (exit code {result.exit_code})" if result.exit_code else ""
     problems = f", but {'; '.join(result.problems)}" if result.problems else ""
-    lines = [f"`make {MAKE_TARGETS[result.mode]}` {verdict} after {_duration(result.seconds)}{exit_code}{problems}."]
+    step = result.failed_step or f"make {MAKE_TARGETS[result.mode]}"
+    lines = [f"`{step}` {verdict} after {_duration(result.seconds)}{exit_code}{problems}."]
     if result.message:
         lines.append(result.message)
     if result.program_exit_code is not None:
@@ -1452,10 +1620,15 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
             visualize=visualize,
         )
 
+    pins = (
+        " `// dependency: org/name:version` comments in it pin the versions of the packages it uses (pulled from"
+        " Ballerina Central; the build fails if it used another version)."
+    )
     BalFile = Annotated[
-        Optional[str], Field(description="Path to the .bal file to build; it replaces main.bal in a copy of the template. Give this or `source`.")
+        Optional[str],
+        Field(description="Path to the .bal file to build; it replaces main.bal in a copy of the template. Give this or `source`." + pins),
     ]
-    Source = Annotated[Optional[str], Field(description="Ballerina source code to build instead of a file; it becomes main.bal.")]
+    Source = Annotated[Optional[str], Field(description="Ballerina source code to build instead of a file; it becomes main.bal." + pins)]
     OutputDir = Annotated[
         Optional[str],
         Field(
@@ -1515,7 +1688,8 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         "ballerina-builder",
         instructions=(
             f"Builds Ballerina programs inside a container, in a fresh copy of the template project {template}"
-            " (the given file or source replaces its main.bal). compile_ballerina is a quick compile check;"
+            " (the given file or source replaces its main.bal; `// dependency: org/name:version` comments in it pin"
+            " package versions). compile_ballerina is a quick compile check;"
             " build_graalvm makes a native executable (takes minutes); build_docker makes a Docker image saved"
             " as a .tar. output_dir collects the .jar, native executable or image .tar and the reports;"
             " run_tests adds bal test with coverage, security_scan adds bal scan and Trivy, complexity adds"
@@ -1633,6 +1807,12 @@ scripts: with this first line, a .bal file runs like a script (chmod +x hello.ba
   The options before -- are the build's; x y become the program's first arguments, before those of the
   command line. The line is turned into a comment before the build. Build output is hidden unless the
   build fails (-v shows it on stderr), so stdout is the program's own; the exit code is the program's.
+
+dependencies: comments in the file pin the versions of the packages it uses (examples/main_dependencies.bal):
+  // dependency: ballerina/toml:0.3.0
+  They are locked in the copy's Dependencies.toml, and `bal build --sticky` pulls them from Ballerina
+  Central before the Makefile target, which then builds with them. The build fails if it used another
+  version; the summary lists the versions it used.
 
 options of compile, build-graalvm, build-docker and run (see `bal_builder.py COMMAND -h`):
   -o DIR              copy the outputs (target/bin, build-docker's .tar, reports) to DIR
