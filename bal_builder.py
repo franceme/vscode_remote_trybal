@@ -43,7 +43,8 @@ build-docker's image .tar (saved in the current folder without -o) and the repor
   --complexity  cyclomatic and cognitive complexity, nesting and size of each function,
           measured on the template's own Ballerina parser (bal_complexity/)          -> complexity/
   --visualize  the Ballerina VS Code extension's diagrams of each file, function and service
-          (overview, sequence diagram, data mapper), drawn by the extension (bal_visualizer/) -> visualizations/
+          (overview, sequence diagram, data mapper), drawn by the extension (bal_visualizer/), whole,
+          as PNG, SVG (sequence diagrams) and HTML that works offline               -> visualizations/
 Their results are also summarised at the end of the run.
 
 The outputs are named main rather than after the template's package: main.jar, build-graalvm's native
@@ -1253,8 +1254,11 @@ def _visualize(req: BuildRequest, docker: _Docker, out: _Output, project: Path, 
         "files": len(manifest["files"]),
         "kinds": collections.Counter(d["kind"] for d in diagrams if not d.get("error")),
         "svgs": sum(1 for d in diagrams if d.get("svg")),
+        "htmls": sum(1 for d in diagrams if d.get("html")),
         "failed": [f"{d['file']}: {d['name']}: {d['error']}" for d in failed],
         "svg_failed": [f"{d['file']}: {d['name']}: {d['svg_error']}" for d in diagrams if d.get("svg_error")],
+        "html_failed": [f"{d['file']}: {d['name']}: {d['html_error']}" for d in diagrams if d.get("html_error")],
+        "cut_off": [f"{d['file']}: {d['name']}: {d['cut_off']}" for d in diagrams if d.get("cut_off")],
     }
     return f"{_plural(len(failed), 'diagram')} could not be captured" if failed else None
 
@@ -1489,12 +1493,15 @@ def _check_lines(result: BuildResult) -> List[str]:
                  "service": ("service", None), "diagram": ("other diagram", None)}
         kinds = ", ".join(_plural(count, *names.get(kind, (kind, None))) for kind, count in viz["kinds"].most_common())
         svgs = f"; {_plural(viz['svgs'], 'SVG')} from the extension's export" if viz["svgs"] else ""
+        htmls = f"; {_plural(viz['htmls'], 'HTML copy', 'HTML copies')} for offline viewing" if viz["htmls"] else ""
         lines.append(
             f"Visualizations (Ballerina extension {viz['extension']} in VS Code {viz['vscode']}, {_plural(viz['files'], 'file')}):"
-            f" {kinds or 'nothing to draw'}{svgs}."
+            f" {kinds or 'nothing to draw'}{svgs}{htmls}."
         )
         lines += [f"  not captured: {failure}" for failure in viz["failed"]]
-        lines += [f"  PNG only: {failure}" for failure in viz["svg_failed"]]
+        lines += [f"  cut off: {failure}" for failure in viz["cut_off"]]
+        lines += [f"  no SVG: {failure}" for failure in viz["svg_failed"]]
+        lines += [f"  no HTML copy: {failure}" for failure in viz["html_failed"]]
     return lines
 
 
@@ -1727,8 +1734,8 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         Field(
             description="Also save the Ballerina VS Code extension's diagrams, drawn by the extension itself in a headless VS Code:"
             " each file's overview and, for each function, method, service and resource, its sequence diagram, data mapper or"
-            " service view (PNG, plus the extension's SVG export of sequence diagrams) in output_dir/visualizations, with an"
-            " index.html. Needs output_dir. The first run builds two images."
+            " service view, whole, in output_dir/visualizations: a PNG, the extension's SVG export of sequence diagrams, and an"
+            " HTML copy that works offline; with an index.html. Needs output_dir. The first run builds two images."
         ),
     ]
     KeepTemp = Annotated[
@@ -1982,7 +1989,8 @@ def _build_options() -> argparse.ArgumentParser:
         action="store_true",
         help="also save the diagrams the Ballerina VS Code extension draws, drawn by the extension itself in a headless VS Code:"
         " each file's overview and the sequence diagram, data mapper or service view of each function, method, service and"
-        " resource, as PNG (plus the extension's SVG export of sequence diagrams) with an index.html (-> DIR/visualizations; needs -o)",
+        " resource, whole: a PNG, the extension's SVG export of sequence diagrams, and an HTML copy that works offline, with an"
+        " index.html (-> DIR/visualizations; needs -o)",
     )
     build.add_argument("-k", "--keep", action="store_true", help="leave the temporary folder and the container, and print where they are")
     return build

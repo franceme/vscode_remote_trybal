@@ -3,9 +3,10 @@
 Runs with Playwright in a browser container that shares the network of the container running code-server
 (a headless VS Code with the Ballerina extension and driver/ installed). For every .bal file it opens the
 file's overview and each diagram the extension offers through its "Visualize" code lenses (functions,
-methods, services and resource functions), and saves:
+methods, services and resource functions), grows the window until the whole diagram fits, and saves:
   - a PNG of the diagram as the extension shows it (a sequence diagram, a data mapper, a service, ...);
-  - for sequence diagrams, also the SVG of the extension's own "download" button (the whole diagram).
+  - for sequence diagrams, also the SVG of the extension's own "download" button;
+  - an HTML copy of the diagram's page that works offline: styles, fonts and images included, scripts left out.
 It writes visualizations.json (what was captured, and what failed) and index.html (all of them on one page).
 
     python3 capture.py --out DIR [--workspace /workspace]
@@ -16,6 +17,7 @@ Exits 0 when the diagrams could be listed, even if some of them failed; visualiz
 import argparse
 import html
 import json
+import math
 import re
 import sys
 import time
@@ -49,6 +51,118 @@ DIAGRAM_STATE = """() => {
     return {kind, size: d.innerHTML.length};
 }"""
 SVG_EXPORT = ".tools > .zoom-control-wrapper:last-child"  # the sequence diagram's download button (html-to-image SVG)
+
+# The window grows until the whole diagram is inside the webview: what doesn't fit is cut off in the PNG, and in the
+# SVG export, which covers the diagram's container rather than what is drawn in it.
+FIT_PROBE = 200  # px the window grows by, to tell what is drawn from what sticks to the window's edges
+FIT_MARGIN = 32  # px left free beyond the diagram
+MAX_VIEWPORT = 16000  # px; Chromium can't take larger screenshots
+
+# The boxes of what the diagram draws (text, SVG shapes, images), in the order of window.__balDrawn; with `remember`,
+# that list is made first. Their containers are left out: many are sized to the window, so they always fill it.
+DRAWN = r"""(remember) => {
+    const root = document.querySelector('#diagram');
+    const visible = (e) => {
+        for (; e && e !== root; e = e.parentElement) {
+            const s = getComputedStyle(e);
+            if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') return false;
+        }
+        return true;
+    };
+    if (remember) {
+        const drawn = [];
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        for (let t = walker.nextNode(); t; t = walker.nextNode()) if (t.textContent.trim()) drawn.push(t);
+        drawn.push(...root.querySelectorAll('path, rect, line, circle, ellipse, polygon, polyline, image, use, img, canvas'));
+        window.__balDrawn = drawn;
+    }
+    const range = document.createRange();
+    return window.__balDrawn.map((node) => {
+        const text = node.nodeType === Node.TEXT_NODE;
+        if (!node.isConnected || !visible(text ? node.parentElement : node)) return null;
+        if (text) range.selectNodeContents(node);
+        const b = (text ? range : node).getBoundingClientRect();
+        return b.width || b.height ? [b.right, b.bottom] : null;
+    });
+}"""
+
+# A self-contained copy of the webview page, for viewing offline: its DOM without scripts or <base>, every CSS rule
+# (also those added with insertRule, which aren't in any <style>'s text), and fonts and images as data: URLs. Sizes
+# relative to the window (vh, vw) are frozen at their pixel values, so the copy shows the whole diagram in any window.
+SNAPSHOT = r"""async (title) => {
+    const vh = innerHeight / 100, vw = innerWidth / 100;
+    const units = {vh, vw, vmin: Math.min(vh, vw), vmax: Math.max(vh, vw)};
+    const freeze = (text) => text.replace(/(-?\d*\.?\d+)(vh|vw|vmin|vmax)\b/g, (m, n, unit) => `${+(n * units[unit]).toFixed(2)}px`);
+    const loaded = new Map();
+    const dataUrl = (url) => {
+        if (!loaded.has(url)) {
+            loaded.set(url, fetch(url)
+                .then((r) => r.ok ? r.blob() : Promise.reject(r.status))
+                .then((blob) => new Promise((ok, fail) => {
+                    const reader = new FileReader();
+                    reader.onload = () => ok(reader.result);
+                    reader.onerror = fail;
+                    reader.readAsDataURL(blob);
+                }))
+                .catch(() => 'data:,'));  // what the page itself can't load (a broken font URL) stays empty, as it is there
+        }
+        return loaded.get(url);
+    };
+    const URLS = /url\(\s*(['"]?)(.*?)\1\s*\)/g;
+    const inline = async (css, base) => {
+        const urls = await Promise.all([...css.matchAll(URLS)].map((m) =>
+            m[2].startsWith('data:') || m[2].startsWith('#') ? m[2] : dataUrl(new URL(m[2], base).href)));
+        let i = 0;
+        return css.replace(URLS, () => `url("${urls[i++]}")`);
+    };
+    const css = [];
+    for (const sheet of [...document.styleSheets, ...(document.adoptedStyleSheets || [])]) {
+        let text = '';
+        try {
+            text = [...sheet.cssRules].map((rule) => rule.cssText).join('\n');
+        } catch (e) {  // another origin's stylesheet
+            if (sheet.href) text = await fetch(sheet.href).then((r) => r.text()).catch(() => '');
+        }
+        css.push(await inline(text, sheet.href || document.baseURI));
+    }
+    const page = document.documentElement.cloneNode(true);
+    const canvases = document.querySelectorAll('canvas');  // a clone of a canvas is blank: keep its pixels as an image
+    page.querySelectorAll('canvas').forEach((copy, i) => {
+        const img = document.createElement('img');
+        try { img.src = canvases[i].toDataURL(); } catch (e) {}
+        img.style.cssText = copy.style.cssText;
+        img.width = canvases[i].width;
+        img.height = canvases[i].height;
+        copy.replaceWith(img);
+    });
+    page.querySelectorAll('base, script, style, link[rel~="stylesheet"], link[rel="preload"], link[rel="modulepreload"], meta')
+        .forEach((e) => e.remove());
+    for (const img of page.querySelectorAll('img[src]')) {
+        const src = img.getAttribute('src');
+        if (!src.startsWith('data:')) img.setAttribute('src', await dataUrl(new URL(src, document.baseURI).href));
+    }
+    for (const image of page.querySelectorAll('image')) {
+        for (const name of ['href', 'xlink:href']) {
+            const href = image.getAttribute(name);
+            if (href && !href.startsWith('#') && !href.startsWith('data:')) image.setAttribute(name, await dataUrl(new URL(href, document.baseURI).href));
+        }
+    }
+    for (const e of page.querySelectorAll('[style]')) e.setAttribute('style', freeze(await inline(e.getAttribute('style'), document.baseURI)));
+    for (const e of page.querySelectorAll('[width], [height]')) {
+        for (const name of ['width', 'height']) if (e.hasAttribute(name)) e.setAttribute(name, freeze(e.getAttribute(name)));
+    }
+    const head = page.querySelector('head') || page.insertBefore(document.createElement('head'), page.firstChild);
+    const charset = document.createElement('meta');
+    charset.setAttribute('charset', 'utf-8');
+    const name = document.createElement('title');
+    name.textContent = title;
+    const style = document.createElement('style');
+    style.textContent = freeze(css.join('\n')) + `\nhtml { overflow: auto !important; }` +
+        `\nhtml, body { min-width: ${innerWidth}px !important; min-height: ${innerHeight}px !important; }`;
+    head.prepend(charset, name);
+    head.append(style);
+    return '<!DOCTYPE html>\n' + page.outerHTML + '\n';
+}"""
 
 
 class Driver:
@@ -113,6 +227,47 @@ def rendered(page: Page, old: Optional[Frame]) -> tuple:
     raise RuntimeError(f"it was not drawn within {RENDER_TIMEOUT}s")
 
 
+def settle(frame: Frame) -> None:
+    """Wait until the diagram in `frame` stops changing again, after the window was resized."""
+    deadline = time.monotonic() + RENDER_TIMEOUT
+    last, since = None, time.monotonic()
+    while time.monotonic() < deadline:
+        state = frame.evaluate(DIAGRAM_STATE)
+        if state != last:
+            last, since = state, time.monotonic()
+        elif time.monotonic() - since >= STABLE_FOR:
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"it did not settle within {RENDER_TIMEOUT}s of resizing the window")
+
+
+def fit(page: Page, frame: Frame) -> bool:
+    """Grow the window until the whole diagram is inside the webview; False if it is larger than MAX_VIEWPORT allows."""
+    size = page.viewport_size
+    before = frame.evaluate(DRAWN, True)
+    page.set_viewport_size({"width": size["width"] + FIT_PROBE, "height": size["height"] + FIT_PROBE})
+    settle(frame)
+    after = frame.evaluate(DRAWN, False)
+    # What moved or grew with the window's right or bottom edge sticks to it (zoom buttons, ...): it always fits.
+    kept = [i for i, (a, b) in enumerate(zip(before, after)) if a and b and b[0] - a[0] < FIT_PROBE * 0.75 and b[1] - a[1] < FIT_PROBE * 0.75]
+    for attempt in range(5):  # centred diagrams move as the window grows, so measure again until it stays the same
+        boxes = frame.evaluate(DRAWN, False)
+        right = max((boxes[i][0] for i in kept if boxes[i]), default=0)
+        bottom = max((boxes[i][1] for i in kept if boxes[i]), default=0)
+        width, height = frame.evaluate("() => [innerWidth, innerHeight]")  # the webview's, inside VS Code's window
+        size = page.viewport_size
+        needed = {
+            "width": max(VIEWPORT["width"], size["width"] + math.ceil(right + FIT_MARGIN - width)),
+            "height": max(VIEWPORT["height"], size["height"] + math.ceil(bottom + FIT_MARGIN - height)),
+        }
+        wanted = {key: min(MAX_VIEWPORT, value) for key, value in needed.items()}
+        if wanted == size or attempt == 4:
+            return wanted == needed and wanted == size
+        page.set_viewport_size(wanted)
+        settle(frame)
+    return False
+
+
 def label(item: dict, items: list) -> str:
     """A readable name for a visualize target from its first line: main, Counter.increment, service /api.get greeting."""
     header = item["header"]
@@ -156,6 +311,7 @@ def capture(page: Page, driver: Driver, out: Path, workspace: str) -> dict:
             record = {"name": name, "line": line}
             print(f"  {entry['file']}: {name}", flush=True)
             try:
+                page.set_viewport_size(VIEWPORT)
                 driver.call("/open", {"fsPath": entry["fsPath"], "position": position})
                 frame, kind = rendered(page, old)
                 old = frame
@@ -165,6 +321,9 @@ def capture(page: Page, driver: Driver, out: Path, workspace: str) -> dict:
                     stem = f"{stem}.L{line}"
                 used.add(stem)
                 record["kind"] = kind
+                if not fit(page, frame):
+                    record["cut_off"] = f"larger than {MAX_VIEWPORT}px, so cut off at that size"
+                    print(f"    {record['cut_off']}", flush=True)
                 frame.locator("#diagram").screenshot(path=str(folder / f"{stem}.png"))
                 record["png"] = f"{entry['file']}/{stem}.png"
                 if kind == "sequence":
@@ -175,6 +334,12 @@ def capture(page: Page, driver: Driver, out: Path, workspace: str) -> dict:
                         record["svg"] = f"{entry['file']}/{stem}.svg"
                     except PlaywrightError as exc:
                         record["svg_error"] = f"the extension's SVG export failed: {exc}".splitlines()[0]
+                try:
+                    title = f"{entry['file']}: {name} ({kind})"
+                    (folder / f"{stem}.html").write_text(frame.evaluate(SNAPSHOT, title), encoding="utf-8")
+                    record["html"] = f"{entry['file']}/{stem}.html"
+                except PlaywrightError as exc:
+                    record["html_error"] = f"the HTML copy failed: {exc}".splitlines()[0]
             except (RuntimeError, PlaywrightError, OSError) as exc:
                 record["error"] = str(exc).splitlines()[0]
                 print(f"    failed: {record['error']}", flush=True)
@@ -193,9 +358,12 @@ def index_html(manifest: dict) -> str:
             caption = f"{esc(d['name'])}{esc(where)} <span>{esc(d.get('kind', ''))}</span>"
             if d.get("svg"):
                 caption += f' · <a href="{esc(d["svg"])}">SVG</a>'
+            if d.get("html"):
+                caption += f' · <a href="{esc(d["html"])}">HTML</a>'
             body = f'<a href="{esc(d["png"])}"><img src="{esc(d["png"])}" alt="{esc(d["name"])}" loading="lazy"></a>' if d.get("png") else ""
-            if d.get("error"):
-                body += f'<p class="error">{esc(d["error"])}</p>'
+            for problem in ("error", "cut_off", "html_error"):
+                if d.get(problem):
+                    body += f'<p class="error">{esc(d[problem])}</p>'
             figures.append(f"<figure>{body}<figcaption>{caption}</figcaption></figure>")
         sections.append(f"<section><h2>{esc(entry['file'])}</h2>{''.join(figures)}</section>")
     return f"""<!doctype html>
