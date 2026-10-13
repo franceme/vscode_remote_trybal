@@ -30,6 +30,11 @@ container from the template's dev-container image (.devcontainer/), copies the p
 Makefile target and streams its output while it runs. The template is re-read on every build, so
 changes to it apply straight away.
 
+--url URL (MCP: template_url, or `mcp --url URL` for every build) takes the template from a Git
+repository instead: each build clones it (only the commit it builds) into its temporary folder and
+goes on as above. A GitHub URL as the browser shows it works, for the repository or a folder of it:
+https://github.com/OWNER/REPO, or https://github.com/OWNER/REPO/tree/BRANCH/FOLDER.
+
 `// dependency: org/name:version` comments in the file pin the versions of the packages it uses: they are
 locked in the copy's Dependencies.toml, `bal build --sticky` pulls them from Ballerina Central before the
 Makefile target builds with them, and the build fails if it used another version (examples/main_dependencies.bal).
@@ -55,6 +60,11 @@ After a successful build the temporary folder and the container are removed. --k
 leaves both in place and prints where they are. A failed or cancelled build always keeps the
 temporary folder (project/, synced back from the container, and build.log) and prints its path; the
 container is removed.
+
+`clean` removes what builds left behind, now or before: their containers (kept, or left by a build that
+was killed, including builds still running), the temporary folders, the images that rebuilds replaced and
+those of template folders that are gone. `clean --all` also removes the images and the Trivy cache that
+later builds reuse. It lists them first and asks; --yes doesn't ask.
 """
 
 import argparse
@@ -76,11 +86,12 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 import warnings
 import zipfile
 from pathlib import Path
-from typing import Callable, Deque, Dict, Generator, List, Optional
+from typing import Callable, Deque, Dict, Generator, List, Optional, Tuple
 
 SCRIPT_PATH = Path(__file__).resolve()
 TEMPLATE_ENV = "BAL_BUILDER_TEMPLATE"
@@ -188,6 +199,7 @@ class BuildRequest:
     bal_file: Optional[Path] = None  # the .bal file that replaces main.bal ...
     source: Optional[str] = None  # ... or its source code (handy for MCP clients)
     template: Path = SCRIPT_PATH.parent
+    url: Optional[str] = None  # a Git repository (e.g. on GitHub) cloned for the build and used as the template instead
     image: Optional[str] = None  # use this image instead of the template's dev-container image
     rebuild_image: bool = False  # rebuild the template image (pulling its base) even if .devcontainer is unchanged
     keep: bool = False  # leave the temporary folder and the container in place
@@ -213,7 +225,7 @@ class BuildResult:
     message: str = ""
     problems: List[str] = dataclasses.field(default_factory=list)  # failed checks (the build itself worked)
     exit_code: Optional[int] = None
-    failed_step: Optional[str] = None  # the command that failed, when it ran before the Makefile target
+    failed_step: Optional[str] = None  # what failed before the Makefile target: a `command`, or a step such as the clone
     seconds: float = 0.0
     artifacts: List[str] = dataclasses.field(default_factory=list)  # files written outside the temporary folder
     reports: List[str] = dataclasses.field(default_factory=list)  # report folders written to output_dir
@@ -226,6 +238,7 @@ class BuildResult:
     visualizations: Optional[dict] = None  # summary of the captured diagrams
     dependencies: Optional[List[list]] = None  # [package, declared version, version the build used] per `// dependency:`
     program_exit_code: Optional[int] = None  # run: the program's exit code, once it has run
+    template: Optional[str] = None  # url: the repository and the commit of it that the build used
     temp_dir: Optional[str] = None  # set when the temporary folder was left in place
     container: Optional[str] = None  # set when the container was left in place
     output_tail: str = ""
@@ -527,6 +540,116 @@ def _ignore(root: Path, skip: frozenset, directory: str, names: List[str]) -> Li
     return [name for name in names if _excluded(name, patterns) or Path(directory, name) in skip]
 
 
+def _git_source(url: str) -> Tuple[str, Optional[str]]:
+    """What to clone for --url, and the REF/FOLDER of a GitHub folder's URL (https://github.com/OWNER/REPO/tree/...).
+
+    A GitHub repository's or folder's URL, as the browser shows it, becomes the repository's clone URL; any other
+    URL goes to git as it is.
+    """
+    if not url or url.startswith("-"):  # git would read a leading - as an option
+        raise BuildError(f"{url!r} is not a Git URL.")
+    if re.match(r"(www\.)?github\.com/", url, re.I):
+        url = "https://" + url
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or parts.netloc.lower() not in ("github.com", "www.github.com"):
+        return url, None
+    segments = [urllib.parse.unquote(segment) for segment in parts.path.split("/") if segment]
+    if len(segments) < 2:
+        raise BuildError(f"{url} names no GitHub repository: expected https://github.com/OWNER/REPO.")
+    owner, repo = segments[0], segments[1].removesuffix(".git")
+    if len(segments) == 2:
+        return f"https://github.com/{owner}/{repo}.git", None
+    if segments[2] == "tree" and len(segments) > 3:
+        return f"https://github.com/{owner}/{repo}.git", "/".join(segments[3:])
+    raise BuildError(
+        f"{url} is not a GitHub repository or folder: expected https://github.com/{owner}/{repo} or"
+        f" https://github.com/{owner}/{repo}/tree/BRANCH/FOLDER."
+    )
+
+
+def _git(cancel: CancelToken, *args: str, doing: Optional[str] = None) -> str:
+    """Run git and return its output. It never asks for a password: a private repository needs a credential helper or
+    an SSH key. A failure says what git was `doing`, or names the command."""
+    cancel.check()
+    proc = subprocess.Popen(
+        ["git", *args],
+        stdin=subprocess.DEVNULL,  # in MCP mode stdin carries the protocol
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        env=dict(os.environ, GIT_TERMINAL_PROMPT="0"),
+    )
+    cancel.attach(proc)
+    try:
+        stdout, stderr = proc.communicate()
+    finally:
+        cancel.detach(proc)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    cancel.check()
+    if proc.returncode != 0:
+        raise BuildError(f"{doing or f'`git {shlex.join(args)}`'} failed: {stderr.strip()}")
+    return stdout
+
+
+def _ref_and_folder(cancel: CancelToken, repo: str, tree: str) -> Tuple[str, str]:
+    """The ref and the folder in the REF/FOLDER of a GitHub folder's URL. A branch or tag name can hold slashes too, so
+    the ref is the longest leading part that names one; failing that, the first part, such as a commit hash."""
+    parts = tree.split("/")
+    if len(parts) > 1:
+        listed = _git(cancel, "ls-remote", "--heads", "--tags", repo, doing=f"Listing the branches and tags of {repo}").splitlines()
+        names = {re.sub(r"^refs/(heads|tags)/|\^\{\}$", "", line.partition("\t")[2]) for line in listed}
+        for end in range(len(parts), 1, -1):
+            if "/".join(parts[:end]) in names:
+                return "/".join(parts[:end]), "/".join(parts[end:])
+    return parts[0], "/".join(parts[1:])
+
+
+def _clone_template(req: BuildRequest, out: _Output, cancel: CancelToken, tmp: Path) -> Tuple[Path, str]:
+    """Clone --url's repository into the temporary folder: the template folder in the clone, and what was cloned."""
+    repo, tree = _git_source(req.url)
+    ref, folder = _ref_and_folder(cancel, repo, tree) if tree else (None, "")
+    if ref is not None and ref.startswith("-"):
+        raise BuildError(f"{ref!r} is not a branch, tag or commit.")
+    name = re.sub(r"[^\w.-]+", "-", re.split(r"[/:]", repo.rstrip("/"))[-1].removesuffix(".git")).strip(".-") or "template"
+    clone = tmp / "template" / name  # named after the repository, as is the template image
+    out.status(f"Cloning {repo}" + (f" at {ref}" if ref else "") + f" into {clone}")
+    _git(cancel, "init", "--quiet", str(clone))
+    # Only the one commit, without the history. A branch, a tag or a full commit hash; HEAD is the default branch.
+    fetching = f"Fetching {ref or 'the default branch'} of {repo}"
+    _git(cancel, "-C", str(clone), "fetch", "--quiet", "--depth", "1", repo, ref or "HEAD", doing=fetching)
+    _git(cancel, "-C", str(clone), "checkout", "--quiet", "FETCH_HEAD")
+    commit = _git(cancel, "-C", str(clone), "rev-parse", "HEAD").strip()
+    root = clone.resolve()
+    _drop_outside_links(root, out)
+    template = (root / folder).resolve()
+    if not (template == root or root in template.parents) or not template.is_dir():
+        raise BuildError(f"{repo} has no folder {folder!r} at {ref}.")
+    if not (template / "Ballerina.toml").is_file():
+        where = f"its folder {folder}" if folder else "its top folder"
+        raise BuildError(f"The clone of {repo} is not a Ballerina package: {where} has no Ballerina.toml.")
+    out.status(f"Cloned commit {commit[:12]}")
+    return template, f"{req.url} at commit {commit[:12]}"
+
+
+def _drop_outside_links(root: Path, out: _Output) -> None:
+    """Delete the clone's symbolic links that lead out of it. The copy of the template follows links, so one to a file
+    of this machine (~/.ssh, say) would put that file in the build container, where the template's Makefile runs."""
+    dropped = []
+    for directory, dirs, files in os.walk(root):
+        for name in dirs + files:
+            link = Path(directory, name)
+            if link.is_symlink():
+                target = link.resolve()
+                if not (target == root or root in target.parents):
+                    link.unlink()
+                    dropped.append(str(link.relative_to(root)))
+    if dropped:
+        out.status(f"Deleted {_plural(len(dropped), 'symbolic link')} leading out of the repository: {', '.join(dropped)}")
+
+
 def _copy_template(req: BuildRequest, project: Path, out: _Output) -> None:
     out.status(f"Copying template {req.template}")
     # Follow symlinks: the copy has to be self-contained inside the container, and writing to it must never
@@ -589,7 +712,8 @@ def _template_image(req: BuildRequest, docker: _Docker, out: _Output) -> str:
     if not dockerfile.is_file():
         raise BuildError(f"The template has no dev-container image ({dockerfile} is missing); pass one with --image.")
     name = re.sub(r"[^a-z0-9]+", "-", req.template.name.lower()).strip("-") or "template"
-    tag = f"{LABEL}-{name}:{hashlib.sha1(str(req.template).encode()).hexdigest()[:10]}"
+    source = req.url or str(req.template)  # a clone is in a new folder on every build, so its URL names the image
+    tag = f"{LABEL}-{name}:{hashlib.sha1(source.encode()).hexdigest()[:10]}"
 
     # Rebuild only when the dev-container definition changed: every `docker build` makes a new image ID.
     digest = hashlib.sha256(json.dumps([build.get("args"), build.get("target")]).encode())
@@ -604,7 +728,7 @@ def _template_image(req: BuildRequest, docker: _Docker, out: _Output) -> str:
         out.status(f"Using the template image {tag} (.devcontainer unchanged since it was built)")
         return tag
 
-    args = ["build", "--tag", tag, "--file", str(dockerfile), "--label", f"{LABEL}.template={req.template}"]
+    args = ["build", "--tag", tag, "--file", str(dockerfile), "--label", f"{LABEL}.template={source}"]
     args += ["--label", f"{LABEL}.inputs={inputs}"] + (["--pull"] if req.rebuild_image else [])
     for key, value in (build.get("args") or {}).items():
         args += ["--build-arg", f"{key}={value}"]
@@ -754,7 +878,11 @@ def _normalized(req: BuildRequest) -> BuildRequest:
     if (req.bal_file is None) == (req.source is None):
         raise BuildError("Give either a .bal file or its source code (exactly one of them).")
     template = req.template.expanduser().resolve()
-    if not (template / "Ballerina.toml").is_file():
+    if req.url is not None:  # the clone is checked once it is there
+        if shutil.which("git") is None:
+            raise BuildError("Cloning the template's repository needs git, which was not found on PATH.")
+        _git_source(req.url)  # fails here on a GitHub URL that names no repository or folder
+    elif not (template / "Ballerina.toml").is_file():
         raise BuildError(f"The template {template} is not a Ballerina package (it has no Ballerina.toml).")
     bal_file = req.bal_file.expanduser().resolve() if req.bal_file is not None else None
     if bal_file is not None and not bal_file.is_file():
@@ -1308,6 +1436,11 @@ def run_build(req: BuildRequest, reporter: Reporter, cancel: Optional[CancelToke
     target = MAKE_TARGETS[req.mode]
     try:
         out.status(f"Temporary folder: {tmp}")
+        if req.url is not None:
+            result.failed_step = f"Cloning the template from {req.url}"  # what failed, if the clone does
+            template, result.template = _clone_template(req, out, cancel, tmp)
+            result.failed_step = None
+            req = dataclasses.replace(req, template=template)
         _copy_template(req, project, out)
         image = _template_image(req, docker, out)
         container = f"{LABEL}-{req.mode}-{uuid.uuid4().hex[:8]}"
@@ -1328,7 +1461,7 @@ def run_build(req: BuildRequest, reporter: Reporter, cancel: Optional[CancelToke
             out.status("Resolving the declared dependencies with `bal build --sticky`, which keeps the locked versions")
             result.exit_code = docker.stream("exec", "--workdir", WORKDIR, container, "bal", "build", "--sticky")
             if result.exit_code != 0:
-                result.failed_step = "bal build --sticky"
+                result.failed_step = "`bal build --sticky`"
                 result.message = (
                     f"It resolves the versions pinned with `// dependency:` comments, before `make {target}`. Ballerina"
                     " reports a version that Ballerina Central does not have as `cannot resolve module`."
@@ -1514,12 +1647,14 @@ def format_result(result: BuildResult, output_lines: int = 0) -> str:
         verdict = "failed"
     exit_code = f" (exit code {result.exit_code})" if result.exit_code else ""
     problems = f", but {'; '.join(result.problems)}" if result.problems else ""
-    step = result.failed_step or f"make {MAKE_TARGETS[result.mode]}"
-    lines = [f"`{step}` {verdict} after {_duration(result.seconds)}{exit_code}{problems}."]
+    step = result.failed_step or f"`make {MAKE_TARGETS[result.mode]}`"
+    lines = [f"{step} {verdict} after {_duration(result.seconds)}{exit_code}{problems}."]
     if result.message:
         lines.append(result.message)
     if result.program_exit_code is not None:
         lines.append(f"The program exited with code {result.program_exit_code}.")
+    if result.template:
+        lines.append(f"Template: {result.template}")
     lines += _check_lines(result)
     if result.docker_image:
         lines.append(f"Docker image: {result.docker_image}")
@@ -1537,7 +1672,8 @@ def format_result(result: BuildResult, output_lines: int = 0) -> str:
         lines.append(f"Container kept: {result.container}  (shell: docker exec -it {result.container} bash)")
         cleanup.append(f"docker rm -fv {result.container}")
     if result.temp_dir:
-        lines.append(f"Temporary folder kept: {result.temp_dir}  (project/ and build.log)")
+        kept = sorted(path.name + "/" * path.is_dir() for path in Path(result.temp_dir).iterdir())
+        lines.append(f"Temporary folder kept: {result.temp_dir}  ({', '.join(kept)})")
         cleanup.append(f"rm -rf {shlex.quote(result.temp_dir)}")
     if cleanup:
         lines.append("Remove with: " + " && ".join(cleanup))
@@ -1552,7 +1688,7 @@ def format_result(result: BuildResult, output_lines: int = 0) -> str:
 # --------------------------------------------------------------------------- MCP
 
 
-def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False) -> int:
+def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False, url: Optional[str] = None) -> int:
     """Serve the build capabilities as MCP tools over stdio. Never write to stdout here."""
     if sys.version_info < (3, 10):
         sys.exit("MCP mode needs Python 3.10+ with the `mcp` package (or run: uv run bal_builder.py mcp).")
@@ -1653,6 +1789,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         max_complexity: Optional[int],
         visualize: bool,
         keep_temp: bool,
+        template_url: Optional[str],
     ) -> BuildRequest:
         rebuild, pending_rebuild[0] = pending_rebuild[0], False
         return BuildRequest(
@@ -1660,6 +1797,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
             bal_file=Path(bal_file) if bal_file else None,
             source=source,
             template=template,
+            url=template_url or url,
             image=image,
             rebuild_image=rebuild,
             keep=keep_temp,
@@ -1745,13 +1883,22 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
             " removed after a successful build; a failed build always keeps the temporary folder."
         ),
     ]
+    TemplateUrl = Annotated[
+        Optional[str],
+        Field(
+            description="A Git repository to clone and use as the template for this build, in place of the server's: a GitHub"
+            " repository's or folder's URL (https://github.com/OWNER/REPO, or .../tree/BRANCH/FOLDER) or any URL git clones."
+            " It needs a Ballerina.toml, and a .devcontainer/ unless the server has an image. The result names the commit."
+        ),
+    ]
 
     server = Server(
         "ballerina-builder",
         instructions=(
-            f"Builds Ballerina programs inside a container, in a fresh copy of the template project {template}"
+            f"Builds Ballerina programs inside a container, in a fresh copy of the template project {url or template}"
             " (the given file or source replaces its main.bal; `// dependency: org/name:version` comments in it pin"
-            " package versions). compile_ballerina is a quick compile check;"
+            " package versions; template_url builds with another template, cloned from Git). compile_ballerina is a quick"
+            " compile check;"
             " build_graalvm makes a native executable (takes minutes); build_docker makes a Docker image saved"
             " as a .tar. output_dir collects the .jar, native executable or image .tar and the reports;"
             " run_tests adds bal test with coverage, security_scan adds bal scan and Trivy, complexity adds"
@@ -1775,6 +1922,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         max_complexity: MaxComplexity = None,
         visualize: Visualize = False,
         keep_temp: KeepTemp = False,
+        template_url: TemplateUrl = None,
     ) -> str:
         """Compile a Ballerina program with `make build` (bal build) in a copy of the template project, inside the
         template's container, optionally with its tests, security scans, complexity metrics and diagrams. Returns the outcome,
@@ -1782,7 +1930,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         return await run_tool(
             ctx, request(
                 "compile", bal_file, source, output_dir, output_name, run_tests, test_files, test_source, security_scan, complexity,
-                max_complexity, visualize, keep_temp,
+                max_complexity, visualize, keep_temp, template_url,
             )
         )
 
@@ -1801,6 +1949,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         max_complexity: MaxComplexity = None,
         visualize: Visualize = False,
         keep_temp: KeepTemp = False,
+        template_url: TemplateUrl = None,
     ) -> str:
         """Build a GraalVM native executable with `make build_graalvm` (bal build --graalvm) in a copy of the template
         project, inside the template's container, optionally with its tests, security scans, complexity metrics and
@@ -1809,7 +1958,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         return await run_tool(
             ctx, request(
                 "graalvm", bal_file, source, output_dir, output_name, run_tests, test_files, test_source, security_scan, complexity,
-                max_complexity, visualize, keep_temp,
+                max_complexity, visualize, keep_temp, template_url,
             )
         )
 
@@ -1828,6 +1977,7 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         max_complexity: MaxComplexity = None,
         visualize: Visualize = False,
         keep_temp: KeepTemp = False,
+        template_url: TemplateUrl = None,
     ) -> str:
         """Build a Docker image with `make build_docker` (bal build --cloud=docker) using Docker-in-Docker inside the
         template's container, then save it with `docker save` to a .tar on this machine (load it with docker load -i),
@@ -1835,12 +1985,147 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False)
         return await run_tool(
             ctx, request(
                 "docker", bal_file, source, output_dir, output_name, run_tests, test_files, test_source, security_scan, complexity,
-                max_complexity, visualize, keep_temp,
+                max_complexity, visualize, keep_temp, template_url,
             )
         )
 
     server.run()
     return 0
+
+
+# --------------------------------------------------------------------------- clean
+
+
+# The labels of the images that builds make; an image a rebuild replaced keeps its label, untagged.
+IMAGE_LABELS = (f"{LABEL}.template", f"{LABEL}.scan", f"{LABEL}.visualizer", f"{LABEL}.browser")
+
+
+def _folder_size(path: Path) -> int:
+    total = 0
+    for directory, _, files in os.walk(path):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(directory, name)).st_size
+    return total
+
+
+def _labelled_images(docker: _Docker, label: str) -> List[List[str]]:
+    """[ID, name:tag, size] of the images with this label: the tagged ones, then the untagged ones that no other image
+    is built on, which some image stores list only with --all."""
+    images = []
+    for untagged in ([], ["--all", "--filter", "dangling=true"]):
+        listed = docker.run("image", "ls", "--filter", f"label={label}", *untagged, "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}")
+        images += [line.split("\t") for line in listed.stdout.splitlines() if line.strip()]
+    return images
+
+
+def _gone_templates(docker: _Docker, names: List[str]) -> set:
+    """The images among these whose template folder no longer exists. An image of a --url template is named by its URL."""
+    if not names:
+        return set()
+    listed = docker.run("image", "inspect", "--format", f'{{{{index .Config.Labels "{LABEL}.template"}}}}', *names)
+    return {name for name, source in zip(names, listed.stdout.splitlines()) if source.startswith("/") and not Path(source).exists()}
+
+
+def clean(everything: bool, assume_yes: bool) -> int:
+    """Remove what builds leave behind: their containers (kept with --keep, or left by a build that was killed), the
+    temporary folders of failed and --keep builds, the images that rebuilds replaced and those of template folders that
+    are gone. With `everything`, also the images and the Trivy cache that later builds reuse. Images this script only
+    pulls are left alone."""
+    folders = [(path, _folder_size(path)) for path in sorted(Path(tempfile.gettempdir()).glob(f"{LABEL}-*")) if path.is_dir()]
+    containers: List[List[str]] = []  # [name, state, status]
+    images: Dict[str, str] = {}  # what to remove (a name:tag, or the ID of an untagged image) -> its size
+    volumes: List[str] = []
+    try:
+        _check_docker()
+        docker: Optional[_Docker] = _Docker(None, CancelToken())  # run() writes no build output
+    except BuildError as exc:
+        print(f"{exc}\nSo only the temporary folders can be removed.", file=sys.stderr)
+        docker = None
+    if docker is not None:
+        listed = docker.run("ps", "--all", "--filter", f"label={LABEL}", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}")
+        containers = [line.split("\t") for line in listed.stdout.splitlines() if line.strip()]
+        tagged: Dict[str, str] = {}
+        for label in IMAGE_LABELS:
+            for image_id, name, size in _labelled_images(docker, label):
+                if name == "<none>:<none>":  # replaced by a rebuild
+                    images[image_id] = size
+                elif name.startswith(f"{LABEL}-"):  # an image built from one of these has its labels too, but not its name
+                    tagged[name] = size
+        # Without --all, of the images builds reuse only those of template folders that are gone, which no build can use.
+        keep = set() if everything else set(tagged) - _gone_templates(docker, list(tagged))
+        images.update((name, size) for name, size in tagged.items() if name not in keep)
+        if everything:
+            listed = docker.run("volume", "ls", "--quiet", "--filter", f"name={TRIVY_CACHE_VOLUME}")
+            volumes = [name for name in listed.stdout.split() if name == TRIVY_CACHE_VOLUME]
+
+    if not (containers or images or volumes or folders):
+        print("Nothing to clean: no containers, temporary folders or old images of this script's builds.")
+        return 0
+    if containers:
+        print(f"Containers ({len(containers)}):")
+        print("".join(f"  {name}  {status}\n" for name, state, status in containers), end="")
+        if any(state == "running" for name, state, status in containers):
+            print("  The running ones belong to builds in progress, which this stops.")
+    if images:
+        print(f"Images ({len(images)}; a size counts the layers an image shares with others, which stay while one uses them):")
+        print("".join(f"  {name}  {size}\n" for name, size in images.items()), end="")
+    if volumes:
+        print(f"Volume: {TRIVY_CACHE_VOLUME} (Trivy's vulnerability databases)")
+    if folders:
+        print(f"Temporary folders ({len(folders)}, {sum(size for _, size in folders) / 1e6:.1f} MB):")
+        print("".join(f"  {path}  {size / 1e6:.1f} MB\n" for path, size in folders), end="")
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            sys.stdout.flush()  # the list first, also when stdout is a pipe
+            print(f"Run `bal_builder.py clean{' --all' * everything} --yes` to remove these without being asked.", file=sys.stderr)
+            return 2
+        try:
+            answer = input("Remove all of this? [y/N] ")
+        except (EOFError, KeyboardInterrupt):  # Ctrl-D or Ctrl-C: no
+            answer = ""
+            print()
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Nothing was removed.")
+            return 1
+
+    problems = []
+    removed = []
+    if containers:
+        proc = docker.run("rm", "--force", "--volumes", *(name for name, _, _ in containers), check=False)
+        if proc.returncode != 0:
+            problems.append(proc.stderr.strip())
+        removed.append(_plural(len(containers), "container"))
+    if images:
+        count = 0
+        for name in images:
+            proc = docker.run("image", "rm", name, check=False)
+            if proc.returncode == 0:
+                count += 1
+            else:
+                problems.append(proc.stderr.strip())
+        removed.append(_plural(count, "image"))
+    for volume in volumes:
+        proc = docker.run("volume", "rm", volume, check=False)
+        if proc.returncode == 0:
+            removed.append("the Trivy cache")
+        else:
+            problems.append(proc.stderr.strip())
+    freed = 0
+    for path, size in folders:
+        try:
+            shutil.rmtree(path)
+            freed += size
+        except OSError as exc:
+            problems.append(f"{path}: {exc}")
+    if folders:
+        removed.append(f"{_plural(len(folders), 'temporary folder')} ({freed / 1e6:.1f} MB)")
+    print(f"Removed {', '.join(removed[:-1]) + ' and ' + removed[-1] if len(removed) > 1 else removed[0]}.")
+    if not everything and docker is not None:
+        print("Kept the images and the Trivy cache that later builds reuse; `bal_builder.py clean --all` removes them too.")
+    for problem in problems:
+        print(f"Could not remove: {problem}", file=sys.stderr)
+    return 1 if problems else 0
 
 
 # --------------------------------------------------------------------------- CLI
@@ -1867,6 +2152,9 @@ examples:
   bal_builder.py compile       hello.bal --max-complexity 10   # fail if a function is too complex
   bal_builder.py compile       hello.bal --visualize -o out    # the VS Code extension's diagrams -> out/visualizations
   bal_builder.py run           hello.bal a b                   # build, then run the program with the arguments a b
+  bal_builder.py compile       hello.bal --url https://github.com/OWNER/REPO   # the template cloned from GitHub
+  bal_builder.py clean                                         # remove the containers, temporary folders and old images left behind
+  bal_builder.py clean --all                                   # ... and the images and caches that builds reuse
 
 scripts: with this first line, a .bal file runs like a script (chmod +x hello.bal; ./hello.bal a b):
   #!/usr/bin/env -S bal_builder.py run --scan -- x y
@@ -1891,6 +2179,7 @@ options of compile, build-graalvm, build-docker and run (see `bal_builder.py COM
   --visualize         also save the Ballerina VS Code extension's diagrams of each file and function (needs -o)
   -k, --keep          keep the temporary folder and the container
   -t DIR              template folder (default: ${TEMPLATE_ENV}, else this script's folder)
+  --url URL           clone this Git repository (a GitHub repository or /tree/BRANCH/FOLDER URL) as the template
 
 Build output streams while it runs. After a successful build the temporary folder and the
 container are removed; a failed build keeps the temporary folder and prints its path.""",
@@ -1913,18 +2202,37 @@ container are removed; a failed build keeps the temporary folder and prints its 
     )
     run.add_argument("args", nargs=argparse.REMAINDER, help="the program's arguments")
     commands.add_parser("mcp", parents=[common], help="serve compile/build-graalvm/build-docker as MCP tools over stdio")
+    clean = commands.add_parser(
+        "clean",
+        help="remove what builds leave behind: their containers, temporary folders, and images that no build reuses",
+    )
+    clean.add_argument(
+        "--all",
+        dest="everything",
+        action="store_true",
+        help="also remove the images and the Trivy cache that later builds reuse; the next builds make or download them again",
+    )
+    clean.add_argument("-y", "--yes", action="store_true", help="remove them without asking first")
     return parser
 
 
 def _common_options() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
+    template = common.add_mutually_exclusive_group()
+    template.add_argument(
         "-t",
         "--template",
         type=Path,
         default=Path(os.environ.get(TEMPLATE_ENV) or SCRIPT_PATH.parent),
         metavar="DIR",
         help=f"template project folder (default: ${TEMPLATE_ENV}, else the folder holding this script)",
+    )
+    template.add_argument(
+        "--url",
+        metavar="URL",
+        help="clone this Git repository for each build and use it as the template, in place of -t: a GitHub repository's or"
+        " folder's URL (https://github.com/OWNER/REPO, or .../tree/BRANCH/FOLDER as the browser shows it) or any URL git"
+        " clones. The summary names the commit it built with",
     )
     common.add_argument(
         "--image",
@@ -2059,14 +2367,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         args = _parser().parse_args(argv)
         if args.command == "run" and args.args[:1] == ["--"]:
             args.args = args.args[1:]
+    if args.command == "clean":
+        try:
+            return clean(args.everything, args.yes)
+        except BuildError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     if args.command == "mcp":
-        return serve_mcp(args.template.expanduser().resolve(), args.image, args.rebuild_image)
+        return serve_mcp(args.template.expanduser().resolve(), args.image, args.rebuild_image, args.url)
 
     mode = {"compile": "compile", "build-graalvm": "graalvm", "build-docker": "docker", "run": "run"}[args.command]
     req = BuildRequest(
         mode=mode,
         bal_file=args.bal_file,
         template=args.template,
+        url=args.url,
         image=args.image,
         rebuild_image=args.rebuild_image,
         keep=args.keep,

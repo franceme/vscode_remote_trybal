@@ -23,9 +23,11 @@ python3 bal_builder.py compile       hello.bal --test --scan -o out  # also run 
 python3 bal_builder.py compile       hello.bal --max-complexity 10   # also measure complexity; fail if a function is over 10
 python3 bal_builder.py compile       hello.bal --visualize -o out    # also save the VS Code extension's diagrams in out/visualizations/
 python3 bal_builder.py run           hello.bal a b                   # make build, then run the program with the arguments a b
+python3 bal_builder.py compile hello.bal --url https://github.com/OWNER/REPO  # the same build, with the template cloned from GitHub
+python3 bal_builder.py clean                                                  # remove the containers, temporary folders and old images builds left
 ```
 
-Each run copies this folder (or `--template DIR` / `$BAL_BUILDER_TEMPLATE`) to a temporary folder, replaces `main.bal` with the given file, starts a container from the `.devcontainer` image, runs the Makefile target in it and streams the output. After a successful build the temporary folder and the container are removed; `--keep` leaves both and prints where they are. A failed build keeps the temporary folder (`project/` and `build.log`) and prints its path.
+Each run copies this folder (or `--template DIR` / `$BAL_BUILDER_TEMPLATE`, or a clone of `--url`'s repository) to a temporary folder, replaces `main.bal` with the given file, starts a container from the `.devcontainer` image, runs the Makefile target in it and streams the output. After a successful build the temporary folder and the container are removed; `--keep` leaves both and prints where they are. A failed build keeps the temporary folder (`project/` and `build.log`) and prints its path.
 
 `-o DIR` copies a build's outputs out of the container, so they can be used after the temporary copy is gone: `target/bin` (the executable `.jar`, run with `java -jar`, plus the native executable for `build-graalvm`), the image `.tar` of `build-docker` (load it with `docker load -i`; without `-o` it is saved in the current folder) and the reports of these checks:
 
@@ -40,6 +42,41 @@ Each run copies this folder (or `--template DIR` / `$BAL_BUILDER_TEMPLATE`) to a
 The results are also summarised at the end of each run. Failing tests, a function over `--max-complexity`, a diagram that could not be captured, or a check that cannot run make the run fail; scan findings do not. The first `--scan` downloads the scan image and Trivy's databases, which are kept in the `bal-builder-trivy-cache` Docker volume. The first `--visualize` builds two images (code-server with the extension, and a Playwright browser; about 2 GB to download).
 
 The outputs are named `main`, not after this project's package (`vscode_remote_trybal`): `main.jar`, the native executable `main`, and the image `main:latest`, saved as `main.tar`. `--name NAME` (MCP: `output_name`) names them `NAME` instead, with the image name in lowercase. Without `-o` or `--name`, each `build-docker` run saves `./main.tar` over the previous one.
+
+### Templates from GitHub
+
+`--url URL`, in place of `--template DIR`, takes the template from a Git repository. Each run clones it into its temporary folder and then goes on as with a folder: the repository needs a `Ballerina.toml`, and a `.devcontainer` unless `--image` names one.
+
+```sh
+python3 bal_builder.py compile hello.bal --url https://github.com/franceme/vscode_remote_trybal                       # the default branch
+python3 bal_builder.py compile hello.bal --url https://github.com/franceme/vscode_remote_trybal/tree/master           # a branch, tag or commit
+python3 bal_builder.py compile hello.bal --url https://github.com/OWNER/REPO/tree/BRANCH/FOLDER                       # a folder of the repository
+python3 bal_builder.py compile hello.bal --url git@github.com:OWNER/REPO.git                                          # any URL git clones
+```
+
+- A GitHub URL works as the browser shows it, for the repository or for a folder of it (`/tree/BRANCH/FOLDER`, where the branch name can hold slashes). Any other URL goes to `git` as it is, and builds the default branch.
+- Only the commit to build is fetched, not the history. The summary names it: `Template: https://github.com/... at commit d7d524b22e55`.
+- When the clone is what fails, the summary starts `Cloning the template from URL failed` and says why: a branch, tag or folder that isn't there, a repository git cannot reach, or a clone that is not a Ballerina package.
+- The template image is named after the URL, so the clones of one URL share it, and it is rebuilt only when their `.devcontainer` changes.
+- `git` never asks for a password, as MCP mode keeps stdin for the protocol: a private repository needs a credential helper (such as `gh auth setup-git`) or an SSH key.
+- The copy of the template follows symbolic links, so before it, the links that lead out of the clone are deleted (the run lists them): one to a file of this machine would otherwise put that file in the build container, where the template's Makefile runs. Links within the repository stay.
+- `--url` also works on a script's `#!` line and for the MCP server (below).
+
+### Cleaning up
+
+`clean` removes what builds have left behind, from this run or earlier ones. It lists everything first, with sizes, and asks; `--yes` doesn't ask, and without a terminal it is needed.
+
+```sh
+python3 bal_builder.py clean          # leftovers: containers, temporary folders, images no build reuses
+python3 bal_builder.py clean --all    # also the images and the Trivy cache that later builds reuse
+python3 bal_builder.py clean --yes    # without asking
+```
+
+- Containers: every container of this script's builds (they carry the `bal-builder` label), kept with `--keep` or left by a build that was killed. Running ones belong to builds in progress, which this stops; the list says so.
+- Temporary folders: the `bal-builder-*` folders in the system's temporary folder, kept after failed and `--keep` builds.
+- Images: those a rebuild replaced (untagged, still labelled), and the template images of template folders that no longer exist. `--all` also removes the images that builds reuse: the template images, the scan, visualizer and browser images (`bal-builder-*`), and the `bal-builder-trivy-cache` volume. The next builds make or download them again, which takes minutes for `--visualize`'s images.
+- Images the script only pulls (`ballerina/ballerina`, `aquasec/trivy`, the Playwright image, a `--image`) stay, as other tools may use them; `docker rmi` removes them.
+- When Docker is not running, only the temporary folders are removed.
 
 ### Pinned dependencies
 
@@ -103,4 +140,4 @@ claude mcp add ballerina-builder -- uv run /path/to/bal_builder.py mcp        # 
 claude mcp add ballerina-builder -- python3.13 /path/to/bal_builder.py mcp    # after: python3.13 -m pip install mcp
 ```
 
-Its tools `compile_ballerina`, `build_graalvm` and `build_docker` take `bal_file` (a path) or `source` (the code, which can pin dependencies with `// dependency:` comments), plus `output_dir`, `output_name`, `run_tests`, `test_files`, `test_source`, `security_scan`, `complexity`, `max_complexity`, `visualize` and `keep_temp`. Build output streams as MCP progress notifications.
+Its tools `compile_ballerina`, `build_graalvm` and `build_docker` take `bal_file` (a path) or `source` (the code, which can pin dependencies with `// dependency:` comments), plus `output_dir`, `output_name`, `run_tests`, `test_files`, `test_source`, `security_scan`, `complexity`, `max_complexity`, `visualize`, `keep_temp` and `template_url` (a Git URL, as for `--url`, to clone the template from for that build). `mcp --url URL` makes a repository the server's template for every build. Build output streams as MCP progress notifications.
