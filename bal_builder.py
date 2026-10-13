@@ -33,7 +33,9 @@ changes to it apply straight away.
 --url URL (MCP: template_url, or `mcp --url URL` for every build) takes the template from a Git
 repository instead: each build clones it (only the commit it builds) into its temporary folder and
 goes on as above. A GitHub URL as the browser shows it works, for the repository or a folder of it:
-https://github.com/OWNER/REPO, or https://github.com/OWNER/REPO/tree/BRANCH/FOLDER.
+https://github.com/OWNER/REPO, or https://github.com/OWNER/REPO/tree/BRANCH/FOLDER. When this script has
+no bal_complexity/ or bal_visualizer/ next to it, --complexity and --visualize use the repository's, so
+this script and a .bal file are all a build needs.
 
 `// dependency: org/name:version` comments in the file pin the versions of the packages it uses: they are
 locked in the copy's Dependencies.toml, `bal build --sticky` pulls them from Ballerina Central before the
@@ -47,7 +49,7 @@ build-docker's image .tar (saved in the current folder without -o) and the repor
           and Trivy: vulnerabilities and a CycloneDX SBOM of the .jar or the image     -> trivy/
   --complexity  cyclomatic and cognitive complexity, nesting and size of each function,
           measured on the template's own Ballerina parser (bal_complexity/)          -> complexity/
-  --visualize  the Ballerina VS Code extension's diagrams of each file, function and service
+  --visualize  the Ballerina VS Code extension's diagrams of each source file the build compiled, function and service
           (overview, sequence diagram, data mapper), drawn by the extension (bal_visualizer/), whole,
           as PNG, SVG (sequence diagrams) and HTML that works offline               -> visualizations/
 Their results are also summarised at the end of the run.
@@ -112,9 +114,11 @@ OUTPUT_NAME = "main"
 OUTPUT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 IMAGE_NAME_PATTERN = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*")  # a Docker image name's last path component
 
-# --complexity: the analyser, next to this script (its README explains the rules and how to update them).
-COMPLEXITY_DIR = SCRIPT_PATH.parent / "bal_complexity"
-COMPLEXITY_SOURCE = COMPLEXITY_DIR / "BalComplexity.java"
+# The helpers of --complexity and --visualize are in these folders next to this script. With --url, when this script
+# has none, those of the template's repository are used (BuildRequest.tools).
+# --complexity: the analyser (its README explains the rules and how to update them).
+COMPLEXITY_DIR = "bal_complexity"
+COMPLEXITY_SOURCE = f"{COMPLEXITY_DIR}/BalComplexity.java"
 # It runs with the template's parser jars on a full JDK, which Java's single-file launcher needs to compile
 # it; the template's Ballerina ships only a JRE. The official Ballerina image (also used by --scan) has one.
 COMPLEXITY_JDK_IMAGE = "ballerina/ballerina:2201.13.6"
@@ -122,9 +126,9 @@ COMPLEXITY_LISTED = 10  # most complex functions listed in the summary; complexi
 
 # --visualize: the diagrams of the Ballerina VS Code extension, drawn by the extension itself in a headless VS Code
 # (code-server) and captured with a browser (bal_visualizer/ explains how).
-VISUALIZER_DIR = SCRIPT_PATH.parent / "bal_visualizer"
-VISUALIZER_DRIVER = VISUALIZER_DIR / "driver"  # a small VS Code extension that opens each diagram
-VISUALIZER_CAPTURE = VISUALIZER_DIR / "capture.py"  # runs with Playwright, saves the diagrams
+VISUALIZER_DIR = "bal_visualizer"
+VISUALIZER_DRIVER = f"{VISUALIZER_DIR}/driver"  # a small VS Code extension that opens each diagram
+VISUALIZER_CAPTURE = f"{VISUALIZER_DIR}/capture.py"  # runs with Playwright, saves the diagrams
 # The extension version is the one the template's dev container installs (wso2.ballerina@X in .devcontainer/),
 # so the diagrams look as they do there; this one when .devcontainer names none.
 VISUALIZER_EXTENSION_VERSION = "4.7.9"
@@ -136,7 +140,7 @@ VISUALIZER_DRIVER_PORT = 8766
 # Never copied from the template: VCS data, build output and caches at any depth ...
 EXCLUDE_EVERYWHERE = (".git", "target", "__pycache__", "*.pyc", ".DS_Store")
 # ... and, at the top level, this script, its helpers and the places it writes its outputs by default.
-EXCLUDE_AT_ROOT = (SCRIPT_PATH.name, COMPLEXITY_DIR.name, VISUALIZER_DIR.name, "dist", "*.tar")
+EXCLUDE_AT_ROOT = (SCRIPT_PATH.name, COMPLEXITY_DIR, VISUALIZER_DIR, "dist", "*.tar")
 
 # --scan: bal scan doesn't support the template's Ballerina 2201.7.1, so it runs in a newer official image.
 SCAN_BALLERINA_IMAGE = "ballerina/ballerina:2201.13.6"
@@ -200,6 +204,7 @@ class BuildRequest:
     source: Optional[str] = None  # ... or its source code (handy for MCP clients)
     template: Path = SCRIPT_PATH.parent
     url: Optional[str] = None  # a Git repository (e.g. on GitHub) cloned for the build and used as the template instead
+    tools: Path = SCRIPT_PATH.parent  # the folder with bal_complexity/ and bal_visualizer/: this script's, or with url the clone's
     image: Optional[str] = None  # use this image instead of the template's dev-container image
     rebuild_image: bool = False  # rebuild the template image (pulling its base) even if .devcontainer is unchanged
     keep: bool = False  # leave the temporary folder and the container in place
@@ -211,7 +216,7 @@ class BuildRequest:
     scan: bool = False  # also run bal scan (static analysis) and Trivy (vulnerabilities, SBOM)
     complexity: bool = False  # also measure the complexity of each function
     max_complexity: Optional[int] = None  # fail when a function's cyclomatic complexity is higher (implies complexity)
-    visualize: bool = False  # also save the VS Code extension's diagrams of each file and function (needs output_dir)
+    visualize: bool = False  # also save the VS Code extension's diagrams of each compiled file and function (needs output_dir)
     program_args: List[str] = dataclasses.field(default_factory=list)  # run: the arguments of the program
     tar_path: Optional[Path] = None  # docker: set by _normalized to <output_dir or .>/<name>.tar
     dependencies: List["Dependency"] = dataclasses.field(default_factory=list)  # set by _normalized from `// dependency:` comments
@@ -607,8 +612,9 @@ def _ref_and_folder(cancel: CancelToken, repo: str, tree: str) -> Tuple[str, str
     return parts[0], "/".join(parts[1:])
 
 
-def _clone_template(req: BuildRequest, out: _Output, cancel: CancelToken, tmp: Path) -> Tuple[Path, str]:
-    """Clone --url's repository into the temporary folder: the template folder in the clone, and what was cloned."""
+def _clone_template(req: BuildRequest, out: _Output, cancel: CancelToken, tmp: Path) -> Tuple[Path, Path, str]:
+    """Clone --url's repository into the temporary folder: the template folder in the clone, the folder with the helpers
+    (_clone_tools), and what was cloned."""
     repo, tree = _git_source(req.url)
     ref, folder = _ref_and_folder(cancel, repo, tree) if tree else (None, "")
     if ref is not None and ref.startswith("-"):
@@ -631,7 +637,38 @@ def _clone_template(req: BuildRequest, out: _Output, cancel: CancelToken, tmp: P
         where = f"its folder {folder}" if folder else "its top folder"
         raise BuildError(f"The clone of {repo} is not a Ballerina package: {where} has no Ballerina.toml.")
     out.status(f"Cloned commit {commit[:12]}")
-    return template, f"{req.url} at commit {commit[:12]}"
+    return template, _clone_tools(req, out, root, template), f"{req.url} at commit {commit[:12]}"
+
+
+def _clone_tools(req: BuildRequest, out: _Output, root: Path, template: Path) -> Path:
+    """The folder with the helpers the build's checks need: this script's, or when it lacks them, the clone's (the
+    template's folder or one above it, as the helpers are at the top of the repository and a template may be below)."""
+    complexity = req.complexity or req.max_complexity is not None
+    missing = _missing_tools(req.tools, complexity, req.visualize)
+    if not missing:
+        return req.tools  # this script's own, which match it
+    for folder in (template, *template.parents):
+        if not _missing_tools(folder, complexity, req.visualize):
+            out.status(f"Using {' and '.join(f'{name}/' for name in missing)} of the clone, as this script has none: {folder}")
+            return folder
+        if folder == root:
+            break
+    raise BuildError(_missing_tools_message(missing, f"next to this script ({req.tools}) or in the repository"))
+
+
+def _missing_tools(folder: Path, complexity: bool, visualize: bool) -> List[str]:
+    """The helper folders that the checks need and `folder` lacks: bal_complexity/ and bal_visualizer/."""
+    missing = []
+    if complexity and not (folder / COMPLEXITY_SOURCE).is_file():
+        missing.append(COMPLEXITY_DIR)
+    if visualize and not ((folder / VISUALIZER_CAPTURE).is_file() and (folder / VISUALIZER_DRIVER / "package.json").is_file()):
+        missing.append(VISUALIZER_DIR)
+    return missing
+
+
+def _missing_tools_message(missing: List[str], where: str) -> str:
+    needs = {COMPLEXITY_DIR: "--complexity (MCP: complexity)", VISUALIZER_DIR: "--visualize (MCP: visualize)"}
+    return "; ".join(f"{needs[name]} needs {name}/, which is not {where}" for name in missing) + "."
 
 
 def _drop_outside_links(root: Path, out: _Output) -> None:
@@ -910,12 +947,11 @@ def _normalized(req: BuildRequest) -> BuildRequest:
         raise BuildError(f"The output path {output_dir} exists and is not a folder.")
     if req.max_complexity is not None and req.max_complexity < 1:
         raise BuildError("The complexity limit must be 1 or more.")
-    if (req.complexity or req.max_complexity is not None) and not COMPLEXITY_SOURCE.is_file():
-        raise BuildError(f"The complexity analyser {COMPLEXITY_SOURCE} is missing.")
     if req.visualize and output_dir is None:
         raise BuildError("The diagrams are saved in the output folder: pass one with -o DIR (MCP: output_dir).")
-    if req.visualize and not (VISUALIZER_CAPTURE.is_file() and (VISUALIZER_DRIVER / "package.json").is_file()):
-        raise BuildError(f"The visualizer in {VISUALIZER_DIR} is missing.")
+    missing = _missing_tools(SCRIPT_PATH.parent, req.complexity or req.max_complexity is not None, req.visualize)
+    if missing and req.url is None:  # with --url, the clone may have them
+        raise BuildError(_missing_tools_message(missing, f"next to this script ({SCRIPT_PATH.parent})"))
     return dataclasses.replace(
         req,
         template=template,
@@ -1156,15 +1192,15 @@ def _complexity(req: BuildRequest, docker: _Docker, out: _Output, container: str
     analyser.mkdir()
     for jar in jars:
         docker.run("cp", f"{container}:{jar}", str(analyser))
-    shutil.copy2(COMPLEXITY_SOURCE, analyser)
+    shutil.copy2(req.tools / COMPLEXITY_SOURCE, analyser)
     docker.ensure_image(COMPLEXITY_JDK_IMAGE)
     with docker.helper(COMPLEXITY_JDK_IMAGE, "complexity") as helper:
         docker.copy_in(project, helper, COMPLEXITY_JDK_IMAGE)
         docker.run("cp", f"{analyser}{os.sep}.", f"{helper}:/tmp/complexity")
-        out.status(f"Measuring complexity with the Ballerina {version.group(1)} parser ({COMPLEXITY_SOURCE.name})")
+        out.status(f"Measuring complexity with the Ballerina {version.group(1)} parser ({req.tools / COMPLEXITY_SOURCE})")
         returncode = docker.stream(
             "exec", "--workdir", WORKDIR, helper,
-            "java", "-cp", "/tmp/complexity/*", f"/tmp/complexity/{COMPLEXITY_SOURCE.name}", WORKDIR, "/tmp/complexity.json",
+            "java", "-cp", "/tmp/complexity/*", f"/tmp/complexity/{Path(COMPLEXITY_SOURCE).name}", WORKDIR, "/tmp/complexity.json",
         )
         raw = docker.run("exec", helper, "cat", "/tmp/complexity.json", check=False)
     if returncode != 0 or raw.returncode != 0:
@@ -1289,15 +1325,16 @@ def _visualizer_image(req: BuildRequest, docker: _Docker, out: _Output, tmp: Pat
     """The template image plus code-server, the Ballerina extension and the driver, built on first use."""
     base_id = docker.run("image", "inspect", "--format", "{{.Id}}", base).stdout.strip().split(":")[-1]
     digest = hashlib.sha256(json.dumps([CODE_SERVER_VERSION, VISUALIZER_SETTINGS]).encode())
-    for path in sorted(VISUALIZER_DRIVER.rglob("*")):
+    driver = req.tools / VISUALIZER_DRIVER
+    for path in sorted(driver.rglob("*")):
         if path.is_file():
-            digest.update(path.relative_to(VISUALIZER_DRIVER).as_posix().encode() + b"\0" + path.read_bytes())
+            digest.update(path.relative_to(driver).as_posix().encode() + b"\0" + path.read_bytes())
     tag = f"{LABEL}-visualizer:{base_id[:12]}-{version}-{digest.hexdigest()[:8]}"
     if not req.rebuild_image and docker.run("image", "inspect", tag, check=False).returncode == 0:
         return tag
     context = tmp / "visualizer-image"
     context.mkdir(exist_ok=True)
-    _pack_vsix(VISUALIZER_DRIVER, context / "driver.vsix")
+    _pack_vsix(driver, context / "driver.vsix")
     (context / "settings.json").write_text(json.dumps(VISUALIZER_SETTINGS, indent=2) + "\n", encoding="utf-8")
     vsix = f"https://open-vsx.org/api/wso2/ballerina/{version}/file/wso2.ballerina-{version}.vsix"
     code_server = f"https://github.com/coder/code-server/releases/download/v{CODE_SERVER_VERSION}/code-server-{CODE_SERVER_VERSION}-linux"
@@ -1359,8 +1396,8 @@ def _visualize(req: BuildRequest, docker: _Docker, out: _Output, project: Path, 
         )
         # The browser shares the editor's network, so code-server and the driver are on its 127.0.0.1.
         with docker.helper(browser_image, "browser", network=f"container:{editor}") as browser:
-            docker.run("cp", str(VISUALIZER_CAPTURE), f"{browser}:/tmp/capture.py")
-            out.status("Capturing the diagrams the extension draws for each file, function and service")
+            docker.run("cp", str(req.tools / VISUALIZER_CAPTURE), f"{browser}:/tmp/capture.py")
+            out.status("Capturing the diagrams the extension draws for each source file the build compiled, function and service")
             returncode = docker.stream(
                 "exec", browser, "python3", "/tmp/capture.py", "--out", "/tmp/visualizations", "--workspace", WORKDIR,
                 "--driver", f"http://127.0.0.1:{VISUALIZER_DRIVER_PORT}",
@@ -1438,9 +1475,9 @@ def run_build(req: BuildRequest, reporter: Reporter, cancel: Optional[CancelToke
         out.status(f"Temporary folder: {tmp}")
         if req.url is not None:
             result.failed_step = f"Cloning the template from {req.url}"  # what failed, if the clone does
-            template, result.template = _clone_template(req, out, cancel, tmp)
+            template, tools, result.template = _clone_template(req, out, cancel, tmp)
             result.failed_step = None
-            req = dataclasses.replace(req, template=template)
+            req = dataclasses.replace(req, template=template, tools=tools)
         _copy_template(req, project, out)
         image = _template_image(req, docker, out)
         container = f"{LABEL}-{req.mode}-{uuid.uuid4().hex[:8]}"
@@ -1871,7 +1908,8 @@ def serve_mcp(template: Path, image: Optional[str], rebuild_image: bool = False,
         bool,
         Field(
             description="Also save the Ballerina VS Code extension's diagrams, drawn by the extension itself in a headless VS Code:"
-            " each file's overview and, for each function, method, service and resource, its sequence diagram, data mapper or"
+            " for each source file the build compiled (the package's .bal files and modules/*), the file's overview and, for each"
+            " function, method, service and resource, its sequence diagram, data mapper or"
             " service view, whole, in output_dir/visualizations: a PNG, the extension's SVG export of sequence diagrams, and an"
             " HTML copy that works offline; with an index.html. Needs output_dir. The first run builds two images."
         ),
@@ -2020,11 +2058,13 @@ def _labelled_images(docker: _Docker, label: str) -> List[List[str]]:
 
 
 def _gone_templates(docker: _Docker, names: List[str]) -> set:
-    """The images among these whose template folder no longer exists. An image of a --url template is named by its URL."""
+    """The images among these whose template folder no longer exists: a folder, or a repository on this machine that
+    --url cloned (a path or file:// URL). The others are of --url templates elsewhere, which may still be there."""
     if not names:
         return set()
     listed = docker.run("image", "inspect", "--format", f'{{{{index .Config.Labels "{LABEL}.template"}}}}', *names)
-    return {name for name, source in zip(names, listed.stdout.splitlines()) if source.startswith("/") and not Path(source).exists()}
+    paths = {name: source.removeprefix("file://") for name, source in zip(names, listed.stdout.splitlines())}
+    return {name for name, path in paths.items() if path.startswith("/") and not Path(path).exists()}
 
 
 def clean(everything: bool, assume_yes: bool) -> int:
@@ -2176,7 +2216,7 @@ options of compile, build-graalvm, build-docker and run (see `bal_builder.py COM
   --scan              also run bal scan (in {SCAN_BALLERINA_IMAGE}) and Trivy (vulnerabilities, SBOM)
   --complexity        also measure each function's cyclomatic and cognitive complexity
   --max-complexity N  fail if a function's cyclomatic complexity is over N (implies --complexity)
-  --visualize         also save the Ballerina VS Code extension's diagrams of each file and function (needs -o)
+  --visualize         also save the Ballerina VS Code extension's diagrams of each compiled file and function (needs -o)
   -k, --keep          keep the temporary folder and the container
   -t DIR              template folder (default: ${TEMPLATE_ENV}, else this script's folder)
   --url URL           clone this Git repository (a GitHub repository or /tree/BRANCH/FOLDER URL) as the template
@@ -2296,7 +2336,8 @@ def _build_options() -> argparse.ArgumentParser:
         "--visualize",
         action="store_true",
         help="also save the diagrams the Ballerina VS Code extension draws, drawn by the extension itself in a headless VS Code:"
-        " each file's overview and the sequence diagram, data mapper or service view of each function, method, service and"
+        " for each source file the build compiled (the package's .bal files and modules/*, not tests/), the file's overview and"
+        " the sequence diagram, data mapper or service view of each function, method, service and"
         " resource, whole: a PNG, the extension's SVG export of sequence diagrams, and an HTML copy that works offline, with an"
         " index.html (-> DIR/visualizations; needs -o)",
     )

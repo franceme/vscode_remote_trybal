@@ -1,7 +1,8 @@
 """Capture the Ballerina VS Code extension's diagrams of a project, for bal_builder.py --visualize.
 
 Runs with Playwright in a browser container that shares the network of the container running code-server
-(a headless VS Code with the Ballerina extension and driver/ installed). For every .bal file it opens the
+(a headless VS Code with the Ballerina extension and driver/ installed). For each source file the build compiled
+(the package's .bal files and modules/*, not tests/) it opens the
 file's overview and each diagram the extension offers through its "Visualize" code lenses (functions,
 methods, services and resource functions), grows the window until the whole diagram fits, and saves:
   - a PNG of the diagram as the extension shows it (a sequence diagram, a data mapper, a service, ...);

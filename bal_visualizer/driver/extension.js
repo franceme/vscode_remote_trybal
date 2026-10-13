@@ -1,7 +1,7 @@
 // Runs inside the headless VS Code (code-server) of bal_builder.py --visualize, next to the Ballerina extension.
 // capture.py drives it over HTTP on 127.0.0.1:$BAL_VISUALIZER_PORT:
 //   POST /health   the versions of VS Code and the Ballerina extension, once this extension is up
-//   POST /targets  every .bal file and what the Ballerina extension offers to visualize in it
+//   POST /targets  each source file the build compiled, and what the Ballerina extension offers to visualize in it
 //   POST /open     open one diagram: {fsPath, position} for a function or service, {fsPath} for the file's overview
 const http = require("http");
 const path = require("path");
@@ -48,11 +48,17 @@ function parents(symbols, line) {
   return [];
 }
 
+// The package's source files, which `bal build` compiled: the default module's .bal files and each module's in
+// modules/, as bal_complexity counts them. Not tests/, nor .bal files in other folders (examples, say), which the
+// build leaves out.
+const SOURCES = "{*.bal,modules/*/*.bal}";
+
 async function targets() {
   await ballerina();
   await hideChrome();
-  const root = vscode.workspace.workspaceFolders[0].uri.fsPath;
-  const files = await vscode.workspace.findFiles("**/*.bal", "{**/target/**,**/tests/**}");
+  const folder = vscode.workspace.workspaceFolders[0];
+  const root = folder.uri.fsPath;
+  const files = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, SOURCES));
   files.sort((a, b) => a.fsPath.localeCompare(b.fsPath));
   const out = [];
   let answered = false; // the language server starts lazily; once it has answered, the other files only need a moment
